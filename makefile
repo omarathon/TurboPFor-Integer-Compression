@@ -81,9 +81,9 @@ ifeq (,$(findstring clang, $(CC)))
 OPT+=-falign-loops 
 endif
 
-CFLAGS+=$(DEBUG) $(OPT) 
+CFLAGS+=$(DEBUG) $(OPT)
 #CFLAGS+=-Wno-macro-redefined -Wno-incompatible-pointer-types -Wno-tautological-constant-out-of-range-compare -Wno-discarded-qualifiers
-CFLAGS+=-w -Wall -pedantic
+CFLAGS+=-w -Wall -pedantic -Wno-incompatible-pointer-types -Wno-implicit-function-declaration
 CXXFLAGS+=-w 
 #-Wall -Wincompatible-pointer-types
 ifeq ($(OS),$(filter $(OS),Linux GNU/kFreeBSD GNU OpenBSD FreeBSD DragonFly NetBSD MSYS_NT Haiku))
@@ -97,23 +97,25 @@ endif
 
 all: icapp 
 
+GCC14_COMPAT=-Wno-incompatible-pointer-types -Wno-implicit-function-declaration
+
 $(SRC)bitutil_avx2.o: $(SRC)bitutil.c
-	$(CC) -O3 -w $(_AVX2) $(OPT) -c $(SRC)bitutil.c -o $(SRC)bitutil_avx2.o
+	$(CC) -O3 -w $(_AVX2) $(OPT) $(GCC14_COMPAT) -c $(SRC)bitutil.c -o $(SRC)bitutil_avx2.o
 
 $(SRC)vp4c_avx2.o: $(SRC)vp4c.c
-	$(CC) -O3 -w $(_AVX2) $(OPT) -c $(SRC)vp4c.c -o $(SRC)vp4c_avx2.o
+	$(CC) -O3 -w $(_AVX2) $(OPT) $(GCC14_COMPAT) -c $(SRC)vp4c.c -o $(SRC)vp4c_avx2.o
 
 $(SRC)vp4d_avx2.o: $(SRC)vp4d.c
-	$(CC) -O3 -w $(_AVX2) $(OPT) -c $(SRC)vp4d.c -o $(SRC)vp4d_avx2.o
+	$(CC) -O3 -w $(_AVX2) $(OPT) $(GCC14_COMPAT) -c $(SRC)vp4d.c -o $(SRC)vp4d_avx2.o
 
 $(SRC)bitpack_avx2.o: $(SRC)bitpack.c
-	$(CC) -O3 -w $(_AVX2) $(OPT) -c $(SRC)bitpack.c -o $(SRC)bitpack_avx2.o
+	$(CC) -O3 -w $(_AVX2) $(OPT) $(GCC14_COMPAT) -c $(SRC)bitpack.c -o $(SRC)bitpack_avx2.o
 
 $(SRC)bitunpack_avx2.o: $(SRC)bitunpack.c
-	$(CC) -O3 -w $(_AVX2) $(OPT) -c $(SRC)bitunpack.c -o $(SRC)bitunpack_avx2.o
+	$(CC) -O3 -w $(_AVX2) $(OPT) $(GCC14_COMPAT) -c $(SRC)bitunpack.c -o $(SRC)bitunpack_avx2.o
 
 $(SRC)transpose_avx2.o: $(SRC)transpose.c
-	$(CC) -O3 -w $(_AVX2) $(OPT) -c $(SRC)transpose.c -o $(SRC)transpose_avx2.o
+	$(CC) -O3 -w $(_AVX2) $(OPT) $(GCC14_COMPAT) -c $(SRC)transpose.c -o $(SRC)transpose_avx2.o
 
 -include lib/libext.mak
 

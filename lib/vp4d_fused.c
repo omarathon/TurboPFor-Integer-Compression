@@ -98,9 +98,23 @@ static const unsigned char *_bitunpack128v16_sum(const unsigned char *in,
 // ── driver: mirrors P4NDEC's block loop, accumulating instead of storing ──────
 // Returns the uint32 sum of all n decoded values. PROTOTYPE: requires n % 128 == 0
 // and does not handle the variable-byte tail block.
+#ifdef FUSED_PROFILE
+#include <x86intrin.h>
+uint64_t g_fused_kernel_cyc = 0;  // cycles inside the unpack+merge kernel
+uint64_t g_fused_total_cyc  = 0;  // whole-decode cycles (driver = total - kernel)
+#define KBEG() uint64_t _kt = __rdtsc()
+#define KEND() (g_fused_kernel_cyc += __rdtsc() - _kt)
+#else
+#define KBEG() ((void)0)
+#define KEND() ((void)0)
+#endif
+
 uint32_t p4ndec128v16_sum(const unsigned char *in, unsigned n) {
   const unsigned char *ip = in;
   __m128i sum = _mm_setzero_si128();
+#ifdef FUSED_PROFILE
+  uint64_t _tt = __rdtsc();
+#endif
 
   for (unsigned blk = 0; blk < (n & ~127u); blk += 128) {
     unsigned b = *ip++, bx = 0;
@@ -110,7 +124,9 @@ uint32_t p4ndec128v16_sum(const unsigned char *in, unsigned n) {
       uint16_t u = *(const uint16_t *)ip;
       if (b < 16) u = (uint16_t)(u & ((1u << b) - 1));
       __m128i bc = _mm_set1_epi16((short)u);
-      for (int r = 0; r < 16; ++r) ACC_SUM16(&sum, bc);  // honest: sum the constant stream
+      { KBEG();
+        for (int r = 0; r < 16; ++r) ACC_SUM16(&sum, bc);  // honest: sum the constant stream
+        KEND(); }
       ip += (b + 7) / 8;
     } else if (!(b & 0x40)) {                 // PFOR
       if (b & 0x80) {                         // exceptions present
@@ -120,9 +136,9 @@ uint32_t p4ndec128v16_sum(const unsigned char *in, unsigned n) {
         unsigned xn = popcnt64(ctou64(ip)) + popcnt64(ctou64(ip + 8));
         uint16_t ex[128 + 64];
         const unsigned char *ip2 = bitunpack16((unsigned char *)ip + 16, xn, ex, bx);
-        ip = _bitunpack128v16_sum(ip2, b, ex, bm, &sum);
+        { KBEG(); ip = _bitunpack128v16_sum(ip2, b, ex, bm, &sum); KEND(); }
       } else {                                // no exceptions
-        ip = bitunpack128v16_sum(ip, b, &sum);
+        { KBEG(); ip = bitunpack128v16_sum(ip, b, &sum); KEND(); }
       }
     } else {
       // Variable-byte hybrid exception block. It carries the same information as
@@ -139,7 +155,7 @@ uint32_t p4ndec128v16_sum(const unsigned char *in, unsigned n) {
       uint8_t bm[16] = {0};
       for (unsigned i = 0; i < xn; ++i)                       // positions → bitmap
         bm[pos[i] >> 3] |= (uint8_t)(1u << (pos[i] & 7));
-      _bitunpack128v16_sum(low, b, ex, bm, &sum);             // register-only merge
+      { KBEG(); _bitunpack128v16_sum(low, b, ex, bm, &sum); KEND(); }  // register-only merge
       ip = pos + xn;
     }
   }
@@ -147,5 +163,8 @@ uint32_t p4ndec128v16_sum(const unsigned char *in, unsigned n) {
   // horizontal sum of the 4 u32 lanes
   sum = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, _MM_SHUFFLE(1, 0, 3, 2)));
   sum = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, _MM_SHUFFLE(2, 3, 0, 1)));
+#ifdef FUSED_PROFILE
+  g_fused_total_cyc += __rdtsc() - _tt;
+#endif
   return (uint32_t)_mm_cvtsi128_si32(sum);
 }
