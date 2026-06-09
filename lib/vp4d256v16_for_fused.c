@@ -133,126 +133,6 @@ size_t p4nenc256v16_for(uint16_t *in, size_t n, unsigned char *out) {
   return (size_t)(op - out);
 }
 
-// ── per-block FoR fused decode dispatch ──────────────────────────────────────
-// `a_block` points at this block's first window anchor; for FOR_UNIFORM the
-// block has a single anchor (a_block[0]). `mode`, `sh`, `madd` are loop-invariant
-// (well-predicted). `is_exc` selects the cheap no-exception corrected kernel vs
-// the PFOR-exception kernel. `scratch` is the unused `out` param (kernels are
-// sum-only). NOTE: `b` ranges 0..16 for PLAIN, 0..15 for exception blocks.
-static inline void for_block(const __m256i *low, unsigned b, int is_exc,
-                             const uint16_t *ex, const uint16_t *bm16,
-                             const uint16_t *a_block, uint16_t *scratch,
-                             int mode, unsigned sh, int madd, __m256i *sum) {
-  if (!is_exc) {  // ── PLAIN (no exceptions) ──
-    if (mode == FOR_UNIFORM) {
-      __m256i a = _mm256_set1_epi16((short)a_block[0]);
-      if (madd) simdunpack_u16_il_corrected_uniform_madd(low, scratch, b, a, sum);
-      else      simdunpack_u16_il_corrected_uniform(low, scratch, b, a, sum);
-    } else if (mode == FOR_SCALAR) {
-      if (madd) switch (sh) {
-        case 4:  simdunpack_u16_il_cscalar0_madd(low, scratch, b, a_block, sum); break;
-        case 5:  simdunpack_u16_il_cscalar1_madd(low, scratch, b, a_block, sum); break;
-        case 6:  simdunpack_u16_il_cscalar2_madd(low, scratch, b, a_block, sum); break;
-        default: simdunpack_u16_il_cscalar3_madd(low, scratch, b, a_block, sum); break;
-      } else switch (sh) {
-        case 4:  simdunpack_u16_il_cscalar0(low, scratch, b, a_block, sum); break;
-        case 5:  simdunpack_u16_il_cscalar1(low, scratch, b, a_block, sum); break;
-        case 6:  simdunpack_u16_il_cscalar2(low, scratch, b, a_block, sum); break;
-        default: simdunpack_u16_il_cscalar3(low, scratch, b, a_block, sum); break;
-      }
-    } else if (mode == FOR_HALF) {
-      if (madd) simdunpack_u16_il_corrected_half_madd(low, scratch, b, a_block, sum);
-      else      simdunpack_u16_il_corrected_half(low, scratch, b, a_block, sum);
-    } else {  // FOR_QUARTER
-      if (madd) simdunpack_u16_il_corrected_quarter_madd(low, scratch, b, a_block, sum);
-      else      simdunpack_u16_il_corrected_quarter(low, scratch, b, a_block, sum);
-    }
-  } else {  // ── PFOR exception block ──
-    if (mode == FOR_UNIFORM) {
-      __m256i a = _mm256_set1_epi16((short)a_block[0]);
-      if (madd) simdunpack_u16_il_pfor_cuniform_madd(low, scratch, b, a, sum, ex, bm16);
-      else      simdunpack_u16_il_pfor_cuniform(low, scratch, b, a, sum, ex, bm16);
-    } else if (mode == FOR_SCALAR) {
-      if (madd) switch (sh) {
-        case 4:  simdunpack_u16_il_pfor_cscalar0_madd(low, scratch, b, a_block, sum, ex, bm16); break;
-        case 5:  simdunpack_u16_il_pfor_cscalar1_madd(low, scratch, b, a_block, sum, ex, bm16); break;
-        case 6:  simdunpack_u16_il_pfor_cscalar2_madd(low, scratch, b, a_block, sum, ex, bm16); break;
-        default: simdunpack_u16_il_pfor_cscalar3_madd(low, scratch, b, a_block, sum, ex, bm16); break;
-      } else switch (sh) {
-        case 4:  simdunpack_u16_il_pfor_cscalar0(low, scratch, b, a_block, sum, ex, bm16); break;
-        case 5:  simdunpack_u16_il_pfor_cscalar1(low, scratch, b, a_block, sum, ex, bm16); break;
-        case 6:  simdunpack_u16_il_pfor_cscalar2(low, scratch, b, a_block, sum, ex, bm16); break;
-        default: simdunpack_u16_il_pfor_cscalar3(low, scratch, b, a_block, sum, ex, bm16); break;
-      }
-    } else if (mode == FOR_HALF) {
-      if (madd) simdunpack_u16_il_pfor_chalf_madd(low, scratch, b, a_block, sum, ex, bm16);
-      else      simdunpack_u16_il_pfor_chalf(low, scratch, b, a_block, sum, ex, bm16);
-    } else {  // FOR_QUARTER
-      if (madd) simdunpack_u16_il_pfor_cquarter_madd(low, scratch, b, a_block, sum, ex, bm16);
-      else      simdunpack_u16_il_pfor_cquarter(low, scratch, b, a_block, sum, ex, bm16);
-    }
-  }
-}
-
-// nobc variant: the FoR anchor is NOT added to the OutReg. The residual (low
-// bits + exception merge) is widen-summed into *sum; the anchor's contribution
-// (lanes·anchor per window) is accumulated into *scalar_acc by the _nobc
-// kernels. Final sum = hsum(*sum) + scalar_acc. This keeps the anchor entirely
-// off the SIMD/port-5 path — the lever for beating the plain fused baseline.
-static inline void for_block_nobc(const __m256i *low, unsigned b, int is_exc,
-                                  const uint16_t *ex, const uint16_t *bm16,
-                                  const uint16_t *a_block, uint16_t *scratch,
-                                  int mode, unsigned sh, int madd,
-                                  uint64_t *sacc, __m256i *sum) {
-  if (!is_exc) {  // ── PLAIN (no exceptions); b==0 accumulates anchors only ──
-    if (mode == FOR_UNIFORM) {
-      if (madd) simdunpack_u16_il_corrected_uniform_nobc_madd(low, scratch, b, a_block, sacc, sum);
-      else      simdunpack_u16_il_corrected_uniform_nobc(low, scratch, b, a_block, sacc, sum);
-    } else if (mode == FOR_SCALAR) {
-      if (madd) switch (sh) {
-        case 4:  simdunpack_u16_il_cscalar0_nobc_madd(low, scratch, b, a_block, sacc, sum); break;
-        case 5:  simdunpack_u16_il_cscalar1_nobc_madd(low, scratch, b, a_block, sacc, sum); break;
-        case 6:  simdunpack_u16_il_cscalar2_nobc_madd(low, scratch, b, a_block, sacc, sum); break;
-        default: simdunpack_u16_il_cscalar3_nobc_madd(low, scratch, b, a_block, sacc, sum); break;
-      } else switch (sh) {
-        case 4:  simdunpack_u16_il_cscalar0_nobc(low, scratch, b, a_block, sacc, sum); break;
-        case 5:  simdunpack_u16_il_cscalar1_nobc(low, scratch, b, a_block, sacc, sum); break;
-        case 6:  simdunpack_u16_il_cscalar2_nobc(low, scratch, b, a_block, sacc, sum); break;
-        default: simdunpack_u16_il_cscalar3_nobc(low, scratch, b, a_block, sacc, sum); break;
-      }
-    } else if (mode == FOR_HALF) {
-      if (madd) simdunpack_u16_il_corrected_half_nobc_madd(low, scratch, b, a_block, sacc, sum);
-      else      simdunpack_u16_il_corrected_half_nobc(low, scratch, b, a_block, sacc, sum);
-    } else {  // FOR_QUARTER
-      if (madd) simdunpack_u16_il_corrected_quarter_nobc_madd(low, scratch, b, a_block, sacc, sum);
-      else      simdunpack_u16_il_corrected_quarter_nobc(low, scratch, b, a_block, sacc, sum);
-    }
-  } else {  // ── PFOR exception block ──
-    if (mode == FOR_UNIFORM) {
-      if (madd) simdunpack_u16_il_pfor_cuniform_nobc_madd(low, scratch, b, a_block, sacc, sum, ex, bm16);
-      else      simdunpack_u16_il_pfor_cuniform_nobc(low, scratch, b, a_block, sacc, sum, ex, bm16);
-    } else if (mode == FOR_SCALAR) {
-      if (madd) switch (sh) {
-        case 4:  simdunpack_u16_il_pfor_cscalar0_nobc_madd(low, scratch, b, a_block, sacc, sum, ex, bm16); break;
-        case 5:  simdunpack_u16_il_pfor_cscalar1_nobc_madd(low, scratch, b, a_block, sacc, sum, ex, bm16); break;
-        case 6:  simdunpack_u16_il_pfor_cscalar2_nobc_madd(low, scratch, b, a_block, sacc, sum, ex, bm16); break;
-        default: simdunpack_u16_il_pfor_cscalar3_nobc_madd(low, scratch, b, a_block, sacc, sum, ex, bm16); break;
-      } else switch (sh) {
-        case 4:  simdunpack_u16_il_pfor_cscalar0_nobc(low, scratch, b, a_block, sacc, sum, ex, bm16); break;
-        case 5:  simdunpack_u16_il_pfor_cscalar1_nobc(low, scratch, b, a_block, sacc, sum, ex, bm16); break;
-        case 6:  simdunpack_u16_il_pfor_cscalar2_nobc(low, scratch, b, a_block, sacc, sum, ex, bm16); break;
-        default: simdunpack_u16_il_pfor_cscalar3_nobc(low, scratch, b, a_block, sacc, sum, ex, bm16); break;
-      }
-    } else if (mode == FOR_HALF) {
-      if (madd) simdunpack_u16_il_pfor_chalf_nobc_madd(low, scratch, b, a_block, sacc, sum, ex, bm16);
-      else      simdunpack_u16_il_pfor_chalf_nobc(low, scratch, b, a_block, sacc, sum, ex, bm16);
-    } else {  // FOR_QUARTER
-      if (madd) simdunpack_u16_il_pfor_cquarter_nobc_madd(low, scratch, b, a_block, sacc, sum, ex, bm16);
-      else      simdunpack_u16_il_pfor_cquarter_nobc(low, scratch, b, a_block, sacc, sum, ex, bm16);
-    }
-  }
-}
-
 // ── fused-sum FoR decoder ────────────────────────────────────────────────────
 // `anchors` holds the materialized per-window anchors (the wrapper has already
 // expanded raw/packed/hierarchical into this array). `w` is the FoR window,
@@ -260,62 +140,102 @@ static inline void for_block_nobc(const __m256i *low, unsigned b, int is_exc,
 // `nobc`: when set, use the scalar-anchor-accumulation kernels (anchor off the
 // SIMD path). bc (nobc=0) materializes the anchor into the OutReg (needed for
 // ops that can't factor the anchor out of the aggregate, e.g. multiply).
+//
+// PERF-CRITICAL: the (mode, sh, madd, nobc) dispatch is hoisted ENTIRELY out of
+// the block loop, so each instantiated block-walk calls exactly two dispatchers
+// (PLAIN + exception) — which GCC then inlines, folding their switch(b) into the
+// loop and keeping `sum`/`sacc` in registers across blocks (exactly like the
+// plain fused baseline). A single in-loop mode-switch instead kept all dispatchers
+// out-of-line → a sum/sacc store-load per sub-block, which made FoR *slower* than
+// the baseline despite doing less work. The block-walk body is shared via a macro.
+
+// One full PFor block-walk. PLAINCALL/EXCCALL must decode `low` (and ex/bm16 for
+// EXCCALL) into the running `sum`/`sacc`. `a_block`, `b`, `low`, `ex`, `bm16` are
+// in scope at the call points.
+#define FOR_BLOCKWALK(PLAINCALL, EXCCALL)                                      \
+  for (; base < full; base += BLK) {                                           \
+    const unsigned ctrl = *ip++;                                              \
+    const unsigned bmode = (ctrl >> 5) & 3u;                                  \
+    const unsigned b = ctrl & 0x1f;                                           \
+    const uint16_t *a_block = anchors + (base >> sh); (void)a_block;          \
+    if (bmode == M_PLAIN) {                                                   \
+      const __m256i *low = (const __m256i *)ip; ip += (size_t)b * 32u;        \
+      PLAINCALL;                                                              \
+      continue;                                                               \
+    }                                                                         \
+    /* M_CONST is never emitted for FoR residuals; only exception modes. */   \
+    { uint16_t ex[BLK + 16]; const __m256i *low; const uint16_t *bm16;        \
+      unsigned char bmbuf[32];                                                \
+      if (bmode == M_BITMAP) {                                                \
+        const unsigned bxe = *ip++; const unsigned char *bm = ip; ip += 32;   \
+        unsigned xn = 0;                                                      \
+        for (int wi = 0; wi < 4; ++wi) { uint64_t bits;                      \
+          memcpy(&bits, bm + (size_t)wi * 8, 8);                             \
+          xn += (unsigned)__builtin_popcountll(bits); }                      \
+        ip = bitunpack16(ip, xn, ex, bxe);                                   \
+        low = (const __m256i *)ip; ip += (size_t)b * 32u;                     \
+        bm16 = (const uint16_t *)bm;                                          \
+      } else {                                                               \
+        const unsigned xn = *ip++;                                           \
+        low = (const __m256i *)ip; ip += (size_t)b * 32u;                     \
+        ip = vbdec16((unsigned char *)ip, xn, ex);                           \
+        const unsigned char *pos = ip; ip += xn;                             \
+        memset(bmbuf, 0, 32);                                                \
+        for (unsigned k = 0; k < xn; ++k)                                    \
+          bmbuf[pos[k] >> 3] |= (unsigned char)(1u << (pos[k] & 7));         \
+        bm16 = (const uint16_t *)bmbuf;                                      \
+      }                                                                      \
+      EXCCALL;                                                               \
+    }                                                                         \
+  }
+
+// bc: anchor added to the OutReg (SIMD). uniform broadcasts a_block[0]; the rest
+// pass a_block. SUF = aggregate suffix (empty = unpack, _madd).
+#define FOR_WALK_BC(SUF)                                                                                   \
+  switch (mode) {                                                                                          \
+    case FOR_UNIFORM:                                                                                      \
+      FOR_BLOCKWALK({ __m256i _a = _mm256_set1_epi16((short)a_block[0]);                                   \
+                      simdunpack_u16_il_corrected_uniform##SUF(low, scratch, b, _a, &sum); },              \
+                    { __m256i _a = _mm256_set1_epi16((short)a_block[0]);                                   \
+                      simdunpack_u16_il_pfor_cuniform##SUF(low, scratch, b, _a, &sum, ex, bm16); });       \
+      break;                                                                                               \
+    case FOR_SCALAR: switch (sh) {                                                                         \
+      case 4:  FOR_BLOCKWALK(simdunpack_u16_il_cscalar0##SUF(low, scratch, b, a_block, &sum),              \
+                             simdunpack_u16_il_pfor_cscalar0##SUF(low, scratch, b, a_block, &sum, ex, bm16)); break; \
+      case 5:  FOR_BLOCKWALK(simdunpack_u16_il_cscalar1##SUF(low, scratch, b, a_block, &sum),              \
+                             simdunpack_u16_il_pfor_cscalar1##SUF(low, scratch, b, a_block, &sum, ex, bm16)); break; \
+      case 6:  FOR_BLOCKWALK(simdunpack_u16_il_cscalar2##SUF(low, scratch, b, a_block, &sum),              \
+                             simdunpack_u16_il_pfor_cscalar2##SUF(low, scratch, b, a_block, &sum, ex, bm16)); break; \
+      default: FOR_BLOCKWALK(simdunpack_u16_il_cscalar3##SUF(low, scratch, b, a_block, &sum),              \
+                             simdunpack_u16_il_pfor_cscalar3##SUF(low, scratch, b, a_block, &sum, ex, bm16)); break; \
+    } break;                                                                                               \
+    case FOR_HALF:                                                                                         \
+      FOR_BLOCKWALK(simdunpack_u16_il_corrected_half##SUF(low, scratch, b, a_block, &sum),                 \
+                    simdunpack_u16_il_pfor_chalf##SUF(low, scratch, b, a_block, &sum, ex, bm16)); break;   \
+    default:                                                                                               \
+      FOR_BLOCKWALK(simdunpack_u16_il_corrected_quarter##SUF(low, scratch, b, a_block, &sum),              \
+                    simdunpack_u16_il_pfor_cquarter##SUF(low, scratch, b, a_block, &sum, ex, bm16)); break; \
+  }
+
+// NOTE on nobc: for the SUM aggregate the anchor decouples completely —
+// sum(value) = sum(residual) + w·Σ(window anchors). So the wrapper handles nobc
+// by decoding the residual stream with the plain baseline p4ndec256v16_sum (no
+// anchor at all) and adding w·Σ(anchors) as a single scalar. That's strictly
+// faster (baseline kernels, zero per-block anchor work) and avoids threading a
+// per-block scalar accumulator through inlined kernels. This decoder is the bc
+// path only: the anchor IS materialized into each OutReg (needed for ops that
+// can't factor it out, e.g. multiply).
 uint32_t p4ndec256v16_for_sum(const unsigned char *in, unsigned n,
                               const uint16_t *anchors, unsigned w, unsigned sh,
-                              int mode, int madd, int nobc) {
+                              int mode, int madd) {
   (void)w;
   const unsigned char *ip = in;
   __m256i sum = _mm256_setzero_si256();
-  uint64_t sacc = 0;  // nobc scalar anchor accumulator (unused when !nobc)
   static __thread uint16_t scratch[BLK];
 
   const unsigned full = n & ~(unsigned)(BLK - 1);
   unsigned base = 0;
-  for (; base < full; base += BLK) {
-    const unsigned ctrl = *ip++;
-    const unsigned bmode = (ctrl >> 5) & 3u;
-    const unsigned b = ctrl & 0x1f;
-    const uint16_t *a_block = anchors + (base >> sh);
-
-    if (bmode == M_PLAIN) {
-      const __m256i *low = (const __m256i *)ip;
-      ip += (size_t)b * 32u;
-      // b==0 PLAIN still adds the per-window anchors honestly (corrected b==0).
-      if (nobc) for_block_nobc(low, b, 0, NULL, NULL, a_block, scratch, mode, sh, madd, &sacc, &sum);
-      else      for_block(low, b, 0, NULL, NULL, a_block, scratch, mode, sh, madd, &sum);
-      continue;
-    }
-    // M_CONST is never emitted for FoR residuals (see header); only exception
-    // modes remain.
-    uint16_t ex[BLK + 16];
-    const __m256i *low;
-    const uint16_t *bm16;
-    unsigned char bmbuf[32];
-
-    if (bmode == M_BITMAP) {
-      const unsigned bxe = *ip++;
-      const unsigned char *bm = ip; ip += 32;
-      unsigned xn = 0;
-      for (int wi = 0; wi < 4; ++wi) {
-        uint64_t bits; memcpy(&bits, bm + (size_t)wi * 8, 8);
-        xn += (unsigned)__builtin_popcountll(bits);
-      }
-      ip = bitunpack16(ip, xn, ex, bxe);
-      low = (const __m256i *)ip; ip += (size_t)b * 32u;
-      bm16 = (const uint16_t *)bm;
-    } else {  // M_VBYTE
-      const unsigned xn = *ip++;
-      low = (const __m256i *)ip; ip += (size_t)b * 32u;
-      ip = vbdec16((unsigned char *)ip, xn, ex);
-      const unsigned char *pos = ip; ip += xn;
-      memset(bmbuf, 0, 32);
-      for (unsigned k = 0; k < xn; ++k)
-        bmbuf[pos[k] >> 3] |= (unsigned char)(1u << (pos[k] & 7));
-      bm16 = (const uint16_t *)bmbuf;
-    }
-    if (nobc) for_block_nobc(low, b, 1, ex, bm16, a_block, scratch, mode, sh, madd, &sacc, &sum);
-    else      for_block(low, b, 1, ex, bm16, a_block, scratch, mode, sh, madd, &sum);
-  }
+  if (madd) { FOR_WALK_BC(_madd) } else { FOR_WALK_BC() }
 
   // Tail (n % 256): raw residuals + their per-window anchors, summed honestly.
   const unsigned tail = n - full;
@@ -332,7 +252,7 @@ uint32_t p4ndec256v16_for_sum(const unsigned char *in, unsigned n,
   __m128i s = _mm_add_epi32(lo, hi);
   s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(1, 0, 3, 2)));
   s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(2, 3, 0, 1)));
-  // nobc: add the scalar anchor accumulator (0 when !nobc). uint32 wrap matches
-  // the other fused codecs (sum taken mod 2^32, low/high 16 bits split by caller).
-  return (uint32_t)_mm_cvtsi128_si32(s) + (uint32_t)sacc;
+  return (uint32_t)_mm_cvtsi128_si32(s);
 }
+#undef FOR_BLOCKWALK
+#undef FOR_WALK_BC
