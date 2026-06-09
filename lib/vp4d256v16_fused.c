@@ -340,6 +340,97 @@ uint32_t p4ndec256v16_sum_madd(const unsigned char *in, unsigned n) {
   return (uint32_t)_mm_cvtsi128_si32(s);
 }
 
+// SIMD sum of the first `xn` uint16 in ex[] (widen to u32). Bulk 16-at-a-time +
+// scalar tail (never reads past ex[xn], so bitunpack16's slack stays untouched).
+static inline uint64_t sum_excess_u16(const uint16_t *ex, unsigned xn) {
+  __m256i acc = _mm256_setzero_si256();
+  const __m256i z = _mm256_setzero_si256();
+  unsigned k = 0;
+  for (; k + 16 <= xn; k += 16) {
+    __m256i v = _mm256_loadu_si256((const __m256i *)(ex + k));
+    acc = _mm256_add_epi32(acc, _mm256_unpacklo_epi16(v, z));
+    acc = _mm256_add_epi32(acc, _mm256_unpackhi_epi16(v, z));
+  }
+  __m128i lo = _mm256_castsi256_si128(acc);
+  __m128i hi = _mm256_extracti128_si256(acc, 1);
+  __m128i s = _mm_add_epi32(lo, hi);
+  s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(1, 0, 3, 2)));
+  s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(2, 3, 0, 1)));
+  uint64_t total = (uint32_t)_mm_cvtsi128_si32(s);
+  for (; k < xn; ++k) total += ex[k];
+  return total;
+}
+
+// SUM-ONLY fast decoder: exploits Σvalue = Σ(low bits) + (Σ excess) << b, so an
+// exception block needs NO per-OutReg pshufb merge — decode its low bits like a
+// PLAIN block (madd aggregate) and add the scalar (Σ excess)<<b. The bitmap /
+// positions are parsed only to advance the stream, never consulted. Valid only
+// for the SUM aggregate (position-agnostic) and when madd-safe (every b<=15, so
+// the low bits are < 2^15). Used by the TurboPFor-FoR nobc path on madd-safe
+// residuals — the exception merge was the dominant exception-block cost.
+uint32_t p4ndec256v16_sum_fast(const unsigned char *in, unsigned n) {
+  const unsigned char *ip = in;
+  __m256i sum = _mm256_setzero_si256();      // low-bit (madd) sum
+  uint64_t exc_acc = 0;                       // Σ over blocks of (Σ excess)<<b
+  static __thread uint16_t scratch[BLK];
+  static __thread uint16_t ex[BLK + 16];
+
+  const unsigned full = n & ~(unsigned)(BLK - 1);
+  for (unsigned base = 0; base < full; base += BLK) {
+    const unsigned ctrl = *ip++;
+    const unsigned mode = (ctrl >> 5) & 3u;
+    const unsigned b = ctrl & 0x1f;
+
+    if (mode == M_CONST) {  // never emitted for FoR residuals; honest fallback
+      uint16_t val = (uint16_t)((unsigned)ip[0] | ((unsigned)ip[1] << 8));
+      ip += 2;
+      exc_acc += (uint64_t)BLK * val;
+      continue;
+    }
+    if (mode == M_PLAIN) {
+      const __m256i *low = (const __m256i *)ip;
+      ip += (size_t)b * 32u;
+      simdunpack_u16_il_madd(low, scratch, b, &sum);
+      continue;
+    }
+
+    if (mode == M_BITMAP) {
+      const unsigned bxe = *ip++;
+      const unsigned char *bm = ip; ip += 32;
+      unsigned xn = 0;
+      for (int w = 0; w < 4; ++w) {
+        uint64_t bits; memcpy(&bits, bm + (size_t)w * 8, 8);
+        xn += (unsigned)__builtin_popcountll(bits);
+      }
+      ip = bitunpack16(ip, xn, ex, bxe);
+      const __m256i *low = (const __m256i *)ip; ip += (size_t)b * 32u;
+      exc_acc += sum_excess_u16(ex, xn) << b;
+      simdunpack_u16_il_madd(low, scratch, b, &sum);
+    } else {  // M_VBYTE
+      const unsigned xn = *ip++;
+      const __m256i *low = (const __m256i *)ip; ip += (size_t)b * 32u;
+      ip = vbdec16((unsigned char *)ip, xn, ex);
+      ip += xn;  // positions: skipped (irrelevant to the sum)
+      exc_acc += sum_excess_u16(ex, xn) << b;
+      simdunpack_u16_il_madd(low, scratch, b, &sum);
+    }
+  }
+
+  const unsigned tail = n - full;
+  for (unsigned i = 0; i < tail; ++i) {
+    uint16_t v = (uint16_t)((unsigned)ip[0] | ((unsigned)ip[1] << 8));
+    ip += 2;
+    exc_acc += v;
+  }
+
+  __m128i lo = _mm256_castsi256_si128(sum);
+  __m128i hi = _mm256_extracti128_si256(sum, 1);
+  __m128i s = _mm_add_epi32(lo, hi);
+  s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(1, 0, 3, 2)));
+  s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(2, 3, 0, 1)));
+  return (uint32_t)_mm_cvtsi128_si32(s) + (uint32_t)exc_acc;
+}
+
 // Conservative compressed-size bound: no block exceeds PLAIN at b=16 (1 ctrl +
 // 512 lowbits = 513), exception modes are only chosen when smaller. Tail <=
 // (BLK-1)*2, plus the 32-byte over-read pad. 2*n covers the 512/block bulk.
