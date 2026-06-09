@@ -194,16 +194,79 @@ static inline void for_block(const __m256i *low, unsigned b, int is_exc,
   }
 }
 
+// nobc variant: the FoR anchor is NOT added to the OutReg. The residual (low
+// bits + exception merge) is widen-summed into *sum; the anchor's contribution
+// (lanes·anchor per window) is accumulated into *scalar_acc by the _nobc
+// kernels. Final sum = hsum(*sum) + scalar_acc. This keeps the anchor entirely
+// off the SIMD/port-5 path — the lever for beating the plain fused baseline.
+static inline void for_block_nobc(const __m256i *low, unsigned b, int is_exc,
+                                  const uint16_t *ex, const uint16_t *bm16,
+                                  const uint16_t *a_block, uint16_t *scratch,
+                                  int mode, unsigned sh, int madd,
+                                  uint64_t *sacc, __m256i *sum) {
+  if (!is_exc) {  // ── PLAIN (no exceptions); b==0 accumulates anchors only ──
+    if (mode == FOR_UNIFORM) {
+      if (madd) simdunpack_u16_il_corrected_uniform_nobc_madd(low, scratch, b, a_block, sacc, sum);
+      else      simdunpack_u16_il_corrected_uniform_nobc(low, scratch, b, a_block, sacc, sum);
+    } else if (mode == FOR_SCALAR) {
+      if (madd) switch (sh) {
+        case 4:  simdunpack_u16_il_cscalar0_nobc_madd(low, scratch, b, a_block, sacc, sum); break;
+        case 5:  simdunpack_u16_il_cscalar1_nobc_madd(low, scratch, b, a_block, sacc, sum); break;
+        case 6:  simdunpack_u16_il_cscalar2_nobc_madd(low, scratch, b, a_block, sacc, sum); break;
+        default: simdunpack_u16_il_cscalar3_nobc_madd(low, scratch, b, a_block, sacc, sum); break;
+      } else switch (sh) {
+        case 4:  simdunpack_u16_il_cscalar0_nobc(low, scratch, b, a_block, sacc, sum); break;
+        case 5:  simdunpack_u16_il_cscalar1_nobc(low, scratch, b, a_block, sacc, sum); break;
+        case 6:  simdunpack_u16_il_cscalar2_nobc(low, scratch, b, a_block, sacc, sum); break;
+        default: simdunpack_u16_il_cscalar3_nobc(low, scratch, b, a_block, sacc, sum); break;
+      }
+    } else if (mode == FOR_HALF) {
+      if (madd) simdunpack_u16_il_corrected_half_nobc_madd(low, scratch, b, a_block, sacc, sum);
+      else      simdunpack_u16_il_corrected_half_nobc(low, scratch, b, a_block, sacc, sum);
+    } else {  // FOR_QUARTER
+      if (madd) simdunpack_u16_il_corrected_quarter_nobc_madd(low, scratch, b, a_block, sacc, sum);
+      else      simdunpack_u16_il_corrected_quarter_nobc(low, scratch, b, a_block, sacc, sum);
+    }
+  } else {  // ── PFOR exception block ──
+    if (mode == FOR_UNIFORM) {
+      if (madd) simdunpack_u16_il_pfor_cuniform_nobc_madd(low, scratch, b, a_block, sacc, sum, ex, bm16);
+      else      simdunpack_u16_il_pfor_cuniform_nobc(low, scratch, b, a_block, sacc, sum, ex, bm16);
+    } else if (mode == FOR_SCALAR) {
+      if (madd) switch (sh) {
+        case 4:  simdunpack_u16_il_pfor_cscalar0_nobc_madd(low, scratch, b, a_block, sacc, sum, ex, bm16); break;
+        case 5:  simdunpack_u16_il_pfor_cscalar1_nobc_madd(low, scratch, b, a_block, sacc, sum, ex, bm16); break;
+        case 6:  simdunpack_u16_il_pfor_cscalar2_nobc_madd(low, scratch, b, a_block, sacc, sum, ex, bm16); break;
+        default: simdunpack_u16_il_pfor_cscalar3_nobc_madd(low, scratch, b, a_block, sacc, sum, ex, bm16); break;
+      } else switch (sh) {
+        case 4:  simdunpack_u16_il_pfor_cscalar0_nobc(low, scratch, b, a_block, sacc, sum, ex, bm16); break;
+        case 5:  simdunpack_u16_il_pfor_cscalar1_nobc(low, scratch, b, a_block, sacc, sum, ex, bm16); break;
+        case 6:  simdunpack_u16_il_pfor_cscalar2_nobc(low, scratch, b, a_block, sacc, sum, ex, bm16); break;
+        default: simdunpack_u16_il_pfor_cscalar3_nobc(low, scratch, b, a_block, sacc, sum, ex, bm16); break;
+      }
+    } else if (mode == FOR_HALF) {
+      if (madd) simdunpack_u16_il_pfor_chalf_nobc_madd(low, scratch, b, a_block, sacc, sum, ex, bm16);
+      else      simdunpack_u16_il_pfor_chalf_nobc(low, scratch, b, a_block, sacc, sum, ex, bm16);
+    } else {  // FOR_QUARTER
+      if (madd) simdunpack_u16_il_pfor_cquarter_nobc_madd(low, scratch, b, a_block, sacc, sum, ex, bm16);
+      else      simdunpack_u16_il_pfor_cquarter_nobc(low, scratch, b, a_block, sacc, sum, ex, bm16);
+    }
+  }
+}
+
 // ── fused-sum FoR decoder ────────────────────────────────────────────────────
 // `anchors` holds the materialized per-window anchors (the wrapper has already
 // expanded raw/packed/hierarchical into this array). `w` is the FoR window,
 // `sh` = log2(w), `mode` = FOR_* (chosen from w), `madd` selects the aggregate.
+// `nobc`: when set, use the scalar-anchor-accumulation kernels (anchor off the
+// SIMD path). bc (nobc=0) materializes the anchor into the OutReg (needed for
+// ops that can't factor the anchor out of the aggregate, e.g. multiply).
 uint32_t p4ndec256v16_for_sum(const unsigned char *in, unsigned n,
                               const uint16_t *anchors, unsigned w, unsigned sh,
-                              int mode, int madd) {
+                              int mode, int madd, int nobc) {
   (void)w;
   const unsigned char *ip = in;
   __m256i sum = _mm256_setzero_si256();
+  uint64_t sacc = 0;  // nobc scalar anchor accumulator (unused when !nobc)
   static __thread uint16_t scratch[BLK];
 
   const unsigned full = n & ~(unsigned)(BLK - 1);
@@ -218,7 +281,8 @@ uint32_t p4ndec256v16_for_sum(const unsigned char *in, unsigned n,
       const __m256i *low = (const __m256i *)ip;
       ip += (size_t)b * 32u;
       // b==0 PLAIN still adds the per-window anchors honestly (corrected b==0).
-      for_block(low, b, /*is_exc=*/0, NULL, NULL, a_block, scratch, mode, sh, madd, &sum);
+      if (nobc) for_block_nobc(low, b, 0, NULL, NULL, a_block, scratch, mode, sh, madd, &sacc, &sum);
+      else      for_block(low, b, 0, NULL, NULL, a_block, scratch, mode, sh, madd, &sum);
       continue;
     }
     // M_CONST is never emitted for FoR residuals (see header); only exception
@@ -249,7 +313,8 @@ uint32_t p4ndec256v16_for_sum(const unsigned char *in, unsigned n,
         bmbuf[pos[k] >> 3] |= (unsigned char)(1u << (pos[k] & 7));
       bm16 = (const uint16_t *)bmbuf;
     }
-    for_block(low, b, /*is_exc=*/1, ex, bm16, a_block, scratch, mode, sh, madd, &sum);
+    if (nobc) for_block_nobc(low, b, 1, ex, bm16, a_block, scratch, mode, sh, madd, &sacc, &sum);
+    else      for_block(low, b, 1, ex, bm16, a_block, scratch, mode, sh, madd, &sum);
   }
 
   // Tail (n % 256): raw residuals + their per-window anchors, summed honestly.
@@ -267,5 +332,7 @@ uint32_t p4ndec256v16_for_sum(const unsigned char *in, unsigned n,
   __m128i s = _mm_add_epi32(lo, hi);
   s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(1, 0, 3, 2)));
   s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(2, 3, 0, 1)));
-  return (uint32_t)_mm_cvtsi128_si32(s);
+  // nobc: add the scalar anchor accumulator (0 when !nobc). uint32 wrap matches
+  // the other fused codecs (sum taken mod 2^32, low/high 16 bits split by caller).
+  return (uint32_t)_mm_cvtsi128_si32(s) + (uint32_t)sacc;
 }
