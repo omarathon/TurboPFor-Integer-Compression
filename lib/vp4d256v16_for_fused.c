@@ -25,6 +25,7 @@
 // GPLv2+ side wrapping the BSD simdcomp kernels + TurboPFor helpers.
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <immintrin.h>
 
@@ -53,6 +54,14 @@ size_t p4nenc256v16_for(uint16_t *in, size_t n, unsigned char *out) {
   unsigned char posbuf[BLK], vbexc[BLK * 3], bitmap[32];
   __m256i packed[16];
 
+  // Tunable exception penalty λ (env FOR_EXC_LAMBDA, default 0 = byte-optimal).
+  // The b-selection minimizes (bytes + λ·xn). λ↑ ⇒ exceptions are penalized ⇒ a
+  // larger b is chosen ⇒ fewer exceptions (worse CR, faster PFor decode). λ→∞ ⇒
+  // b=maxbits per block ⇒ zero exceptions ⇒ pure bit-unpack (→ simdcomp_fused).
+  static double s_lambda = -1.0;
+  if (s_lambda < 0.0) { const char *e = getenv("FOR_EXC_LAMBDA"); s_lambda = e ? atof(e) : 0.0; }
+  const double lambda = s_lambda;
+
   const size_t full = n & ~(size_t)(BLK - 1);
   for (size_t base = 0; base < full; base += BLK) {
     const uint16_t *blk = in + base;
@@ -75,7 +84,8 @@ size_t p4nenc256v16_for(uint16_t *in, size_t n, unsigned char *out) {
       unsigned vbe = bxe <= 7 ? 1u : (bxe <= 14 ? 2u : 3u);
       size_t vb = 1u + (size_t)xn * vbe + xn;
       size_t pos = bm < vb ? bm : vb;
-      size_t cost = 1u + (size_t)32u * (unsigned)b + pos;
+      size_t cost = 1u + (size_t)32u * (unsigned)b + pos
+                    + (size_t)(lambda * (double)xn);  // exception penalty
       if (cost < best_cost) { best_cost = cost; best_b = (unsigned)b; }
     }
 
