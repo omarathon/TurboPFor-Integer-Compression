@@ -26,6 +26,7 @@
 // GPLv2+ side (this file) wrapping the BSD simdcomp kernels + TurboPFor helpers.
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <immintrin.h>
 
@@ -361,6 +362,25 @@ static inline uint64_t sum_excess_u16(const uint16_t *ex, unsigned xn) {
   return total;
 }
 
+// Fused sum of `n` horizontally bit-packed values (b bits each, LSB-first) —
+// the same layout bitpack16 emits. Extracts each field into a scalar accumulator
+// with NO per-value output buffer (vs bitunpack16→ex[]→sum). Reads ceil(n*b/8)
+// bytes; the caller advances ip by that known amount (kept separate so the stream
+// stays aligned regardless of this cursor). b in 1..16.
+static inline uint64_t bitsum16_horizontal(const unsigned char *ip, unsigned n,
+                                           unsigned b) {
+  uint64_t acc = 0, buf = 0;
+  int nbits = 0;
+  const uint64_t mask = ((uint64_t)1 << b) - 1;
+  for (unsigned i = 0; i < n; ++i) {
+    while (nbits < (int)b) { buf |= (uint64_t)(*ip++) << nbits; nbits += 8; }
+    acc += (uint64_t)(buf & mask);
+    buf >>= b;
+    nbits -= (int)b;
+  }
+  return acc;
+}
+
 // SUM-ONLY fast decoder: exploits Σvalue = Σ(low bits) + (Σ excess) << b, so an
 // exception block needs NO per-OutReg pshufb merge — decode its low bits like a
 // PLAIN block (madd aggregate) and add the scalar (Σ excess)<<b. The bitmap /
@@ -369,6 +389,10 @@ static inline uint64_t sum_excess_u16(const uint16_t *ex, unsigned xn) {
 // the low bits are < 2^15). Used by the TurboPFor-FoR nobc path on madd-safe
 // residuals — the exception merge was the dominant exception-block cost.
 uint32_t p4ndec256v16_sum_fast(const unsigned char *in, unsigned n) {
+  // FOR_EXC_NOFUSE=1: bitunpack16→ex[]→SIMD sum (memory round-trip). Default:
+  // fused scalar bit-cursor sum (no ex[] for BITMAP). A/B for the fusion.
+  static int nofuse = -1;
+  if (nofuse < 0) { const char *e = getenv("FOR_EXC_NOFUSE"); nofuse = (e && *e && *e != '0'); }
   const unsigned char *ip = in;
   __m256i sum = _mm256_setzero_si256();      // low-bit (madd) sum
   uint64_t exc_acc = 0;                       // Σ over blocks of (Σ excess)<<b
@@ -402,9 +426,14 @@ uint32_t p4ndec256v16_sum_fast(const unsigned char *in, unsigned n) {
         uint64_t bits; memcpy(&bits, bm + (size_t)w * 8, 8);
         xn += (unsigned)__builtin_popcountll(bits);
       }
-      ip = bitunpack16(ip, xn, ex, bxe);
+      if (nofuse) {
+        ip = bitunpack16(ip, xn, ex, bxe);
+        exc_acc += sum_excess_u16(ex, xn) << b;
+      } else {
+        exc_acc += bitsum16_horizontal(ip, xn, bxe) << b;
+        ip += ((size_t)xn * bxe + 7) >> 3;  // pad8(xn*bxe), matches bitpack16
+      }
       const __m256i *low = (const __m256i *)ip; ip += (size_t)b * 32u;
-      exc_acc += sum_excess_u16(ex, xn) << b;
       simdunpack_u16_il_madd(low, scratch, b, &sum);
     } else {  // M_VBYTE
       const unsigned xn = *ip++;
