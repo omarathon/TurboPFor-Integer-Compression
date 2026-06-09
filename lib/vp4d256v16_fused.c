@@ -290,7 +290,9 @@ uint32_t p4ndec256v16_sum_madd(const unsigned char *in, unsigned n) {
     if (mode == M_PLAIN) {
       const __m256i *low = (const __m256i *)ip;
       ip += (size_t)b * 32u;
-      if (b) simdunpack_u16_il_madd(low, scratch, b, &sum);
+      // b==0 handled in the switch (no-op) — no driver-level guard, matching how
+      // simdcomp's decode dispatches b==0 (fair comparison; no memset either way).
+      simdunpack_u16_il_madd(low, scratch, b, &sum);
       continue;
     }
 
