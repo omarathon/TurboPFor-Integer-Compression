@@ -309,10 +309,14 @@ uint32_t p4ndec256v16_sum_madd(const unsigned char *in, unsigned n) {
         uint64_t bits; memcpy(&bits, bm + (size_t)w * 8, 8);
         xn += (unsigned)__builtin_popcountll(bits);
       }
+#ifndef PFOR_SKIP_EXC
       ip = bitunpack16(ip, xn, ex, bxe);
+#else
+      ip += (((size_t)xn * bxe) + 7u) >> 3;  // skip excess; low-unpack only below
+#endif
       low = (const __m256i *)ip; ip += (size_t)b * 32u;
       bm16 = (const uint16_t *)bm;
-    } else {  // M_VBYTE
+    } else {  // M_VBYTE  (encoder forces BITMAP under PFOR_SKIP_EXC; dead there)
       const unsigned xn = *ip++;
       low = (const __m256i *)ip; ip += (size_t)b * 32u;
       ip = vbdec16((unsigned char *)ip, xn, ex);
@@ -322,7 +326,12 @@ uint32_t p4ndec256v16_sum_madd(const unsigned char *in, unsigned n) {
         bmbuf[pos[k] >> 3] |= (unsigned char)(1u << (pos[k] & 7));
       bm16 = (const uint16_t *)bmbuf;
     }
+#ifndef PFOR_SKIP_EXC
     simdunpack_u16_pfor_il_madd(low, scratch, b, &sum, ex, bm16);
+#else
+    (void)bm16;  // skip the pshufb merge — unpack the low-bit plane only
+    simdunpack_u16_il_madd(low, scratch, b, &sum);
+#endif
   }
 
   const unsigned tail = n - full;
@@ -407,11 +416,19 @@ uint32_t p4ndec256v16_sum_fast(const unsigned char *in, unsigned n) {
         uint64_t bits; memcpy(&bits, bm + (size_t)w * 8, 8);
         xn += (unsigned)__builtin_popcountll(bits);
       }
+#ifndef PFOR_SKIP_EXC
       ip = bitunpack16(ip, xn, ex, bxe);
       const __m256i *low = (const __m256i *)ip; ip += (size_t)b * 32u;
       exc_acc += sum_excess_u16(ex, xn) << b;
       simdunpack_u16_il_madd(low, scratch, b, &sum);
-    } else {  // M_VBYTE
+#else
+      // Diagnostic: skip the excess bit-extraction + reduce; just advance past
+      // the packed excess and unpack the low-bit plane only (sum WRONG).
+      ip += (((size_t)xn * bxe) + 7u) >> 3;
+      const __m256i *low = (const __m256i *)ip; ip += (size_t)b * 32u;
+      simdunpack_u16_il_madd(low, scratch, b, &sum);
+#endif
+    } else {  // M_VBYTE  (encoder forces BITMAP under PFOR_SKIP_EXC; dead there)
       const unsigned xn = *ip++;
       const __m256i *low = (const __m256i *)ip; ip += (size_t)b * 32u;
       ip = vbdec16((unsigned char *)ip, xn, ex);

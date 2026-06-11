@@ -120,7 +120,13 @@ size_t p4nenc256v16_for(uint16_t *in, size_t n, unsigned char *out) {
     const size_t vbyte_excess_sz = (size_t)(vbend - vbexc);
     const size_t bitmap_sz = 1u + 32u + pad8_for((size_t)xn * bxe);
     const size_t vbyte_sz  = 1u + vbyte_excess_sz + xn;
+#ifdef PFOR_SKIP_EXC
+    // Force BITMAP so the decode-skip path can advance past the excess with a
+    // plain PAD8(xn*bxe) (no variable-length vbyte scan needed). Diagnostic only.
+    const int use_vbyte = 0;
+#else
     const int use_vbyte = (xn <= 255) && (vbyte_sz < bitmap_sz);
+#endif
 
     if (!use_vbyte) {  // BITMAP
       *op++ = (unsigned char)((M_BITMAP << 5) | (b & 0x1f));
