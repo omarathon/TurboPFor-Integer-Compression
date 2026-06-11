@@ -443,11 +443,17 @@ uint32_t p4ndec256v16_sum_fast(const unsigned char *in, unsigned n) {
       }
 #if defined(PFOR_BYTE_EXC)
       // Byte-aligned excess: SIMD-sum the raw bytes directly (no bitunpack16).
+      // With PFOR_SKIP_EXC *also* set: skip the byte-sum but keep the byte stream
+      // — the FAIR floor for BYTE (same encoding, exceptions free).
+  #ifndef PFOR_SKIP_EXC
       uint64_t es;
       if (bxe <= 8u) { es = sum_bytes_u8((const unsigned char *)ip, xn); ip += xn; }
       else           { es = sum_excess_u16((const uint16_t *)ip, xn); ip += (size_t)xn * 2u; }
-      const __m256i *low = (const __m256i *)ip; ip += (size_t)b * 32u;
       exc_acc += es << b;
+  #else
+      ip += (bxe <= 8u) ? xn : (size_t)xn * 2u;
+  #endif
+      const __m256i *low = (const __m256i *)ip; ip += (size_t)b * 32u;
       simdunpack_u16_il_madd(low, scratch, b, &sum);
 #elif !defined(PFOR_SKIP_EXC)
       ip = bitunpack16(ip, xn, ex, bxe);
