@@ -80,7 +80,13 @@ size_t p4nenc256v16_for(uint16_t *in, size_t n, unsigned char *out) {
     size_t best_cost = 1u + (size_t)32u * maxbits;
     for (int b = (int)maxbits - 1; b >= 0; --b) {
       unsigned xn = xn_b[b], bxe = maxbits - (unsigned)b;
+#ifdef PFOR_BYTE_EXC
+      // byte-aligned excess: 1 byte/exception (bxe<=8) or 2 (bxe<=16). Honest
+      // cost so b-selection accounts for the larger excess (keeps the bound safe).
+      size_t bm = 1u + 32u + (size_t)xn * (bxe <= 8u ? 1u : 2u);
+#else
       size_t bm = 1u + 32u + pad8_for((size_t)xn * bxe);
+#endif
       unsigned vbe = bxe <= 7 ? 1u : (bxe <= 14 ? 2u : 3u);
       size_t vb = 1u + (size_t)xn * vbe + xn;
       size_t pos = bm < vb ? bm : vb;
@@ -120,9 +126,9 @@ size_t p4nenc256v16_for(uint16_t *in, size_t n, unsigned char *out) {
     const size_t vbyte_excess_sz = (size_t)(vbend - vbexc);
     const size_t bitmap_sz = 1u + 32u + pad8_for((size_t)xn * bxe);
     const size_t vbyte_sz  = 1u + vbyte_excess_sz + xn;
-#ifdef PFOR_SKIP_EXC
-    // Force BITMAP so the decode-skip path can advance past the excess with a
-    // plain PAD8(xn*bxe) (no variable-length vbyte scan needed). Diagnostic only.
+#if defined(PFOR_SKIP_EXC) || defined(PFOR_BYTE_EXC)
+    // Force BITMAP: skip-path advances via PAD8(xn*bxe); byte-path stores excess
+    // as fixed-width bytes (both only implemented for the BITMAP layout).
     const int use_vbyte = 0;
 #else
     const int use_vbyte = (xn <= 255) && (vbyte_sz < bitmap_sz);
@@ -132,7 +138,13 @@ size_t p4nenc256v16_for(uint16_t *in, size_t n, unsigned char *out) {
       *op++ = (unsigned char)((M_BITMAP << 5) | (b & 0x1f));
       *op++ = (unsigned char)bxe;
       memcpy(op, bitmap, 32); op += 32;
+#ifdef PFOR_BYTE_EXC
+      // Fixed-width byte excess (decoder SIMD-sums these directly, no bitunpack16).
+      if (bxe <= 8u) { for (unsigned t = 0; t < xn; ++t) op[t] = (unsigned char)excess[t]; op += xn; }
+      else           { memcpy(op, excess, (size_t)xn * 2u); op += (size_t)xn * 2u; }
+#else
       op = bitpack16(excess, xn, op, bxe);
+#endif
       if (b) { simdpack_u16(masked, packed, b); memcpy(op, packed, (size_t)b * 32u); op += (size_t)b * 32u; }
     } else {           // VBYTE
       *op++ = (unsigned char)((M_VBYTE << 5) | (b & 0x1f));

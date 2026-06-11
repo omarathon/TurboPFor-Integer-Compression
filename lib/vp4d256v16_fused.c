@@ -349,6 +349,21 @@ uint32_t p4ndec256v16_sum_madd(const unsigned char *in, unsigned n) {
   return (uint32_t)_mm_cvtsi128_si32(s);
 }
 
+// SIMD sum of `xn` raw uint8 (byte-aligned excess). vpsadbw against zero sums each
+// 8-byte group into a 64-bit lane (one cheap op/32 bytes); scalar tail. Branchless,
+// no per-value parsing — the whole point of byte-aligned excess.
+static inline uint64_t sum_bytes_u8(const unsigned char *p, unsigned xn) {
+  __m256i acc = _mm256_setzero_si256();
+  const __m256i z = _mm256_setzero_si256();
+  unsigned k = 0;
+  for (; k + 32 <= xn; k += 32)
+    acc = _mm256_add_epi64(acc, _mm256_sad_epu8(_mm256_loadu_si256((const __m256i *)(p + k)), z));
+  uint64_t total = (uint64_t)_mm256_extract_epi64(acc, 0) + (uint64_t)_mm256_extract_epi64(acc, 1)
+                 + (uint64_t)_mm256_extract_epi64(acc, 2) + (uint64_t)_mm256_extract_epi64(acc, 3);
+  for (; k < xn; ++k) total += p[k];
+  return total;
+}
+
 // SIMD sum of the first `xn` uint16 in ex[] (widen to u32). Bulk 16-at-a-time +
 // scalar tail (never reads past ex[xn], so bitunpack16's slack stays untouched).
 static inline uint64_t sum_excess_u16(const uint16_t *ex, unsigned xn) {
@@ -416,7 +431,15 @@ uint32_t p4ndec256v16_sum_fast(const unsigned char *in, unsigned n) {
         uint64_t bits; memcpy(&bits, bm + (size_t)w * 8, 8);
         xn += (unsigned)__builtin_popcountll(bits);
       }
-#ifndef PFOR_SKIP_EXC
+#if defined(PFOR_BYTE_EXC)
+      // Byte-aligned excess: SIMD-sum the raw bytes directly (no bitunpack16).
+      uint64_t es;
+      if (bxe <= 8u) { es = sum_bytes_u8((const unsigned char *)ip, xn); ip += xn; }
+      else           { es = sum_excess_u16((const uint16_t *)ip, xn); ip += (size_t)xn * 2u; }
+      const __m256i *low = (const __m256i *)ip; ip += (size_t)b * 32u;
+      exc_acc += es << b;
+      simdunpack_u16_il_madd(low, scratch, b, &sum);
+#elif !defined(PFOR_SKIP_EXC)
       ip = bitunpack16(ip, xn, ex, bxe);
       const __m256i *low = (const __m256i *)ip; ip += (size_t)b * 32u;
       exc_acc += sum_excess_u16(ex, xn) << b;
