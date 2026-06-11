@@ -177,6 +177,18 @@ size_t p4nenc256v16_for(uint16_t *in, size_t n, unsigned char *out) {
 // out-of-line → a sum/sacc store-load per sub-block, which made FoR *slower* than
 // the baseline despite doing less work. The block-walk body is shared via a macro.
 
+// Read the excess into ex[] (byte-aligned on a PFOR_BYTE_EXC build, else
+// bit-packed). A separate macro because #ifdef can't live inside FOR_BLOCKWALK.
+#ifdef PFOR_BYTE_EXC
+#define FOR_READ_EXCESS(IP, XN, EX, BXE)                                        \
+  do { if ((BXE) <= 8u) { for (unsigned _t = 0; _t < (XN); ++_t)               \
+                            (EX)[_t] = ((const unsigned char *)(IP))[_t];       \
+                          (IP) += (XN); }                                       \
+       else { memcpy((EX), (IP), (size_t)(XN) * 2u); (IP) += (size_t)(XN) * 2u; } } while (0)
+#else
+#define FOR_READ_EXCESS(IP, XN, EX, BXE) do { (IP) = bitunpack16((IP), (XN), (EX), (BXE)); } while (0)
+#endif
+
 // One full PFor block-walk. PLAINCALL/EXCCALL must decode `low` (and ex/bm16 for
 // EXCCALL) into the running `sum`/`sacc`. `a_block`, `b`, `low`, `ex`, `bm16` are
 // in scope at the call points.
@@ -200,7 +212,7 @@ size_t p4nenc256v16_for(uint16_t *in, size_t n, unsigned char *out) {
         for (int wi = 0; wi < 4; ++wi) { uint64_t bits;                      \
           memcpy(&bits, bm + (size_t)wi * 8, 8);                             \
           xn += (unsigned)__builtin_popcountll(bits); }                      \
-        ip = bitunpack16(ip, xn, ex, bxe);                                   \
+        FOR_READ_EXCESS(ip, xn, ex, bxe);                                    \
         low = (const __m256i *)ip; ip += (size_t)b * 32u;                     \
         bm16 = (const uint16_t *)bm;                                          \
       } else {                                                               \
