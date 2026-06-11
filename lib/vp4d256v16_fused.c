@@ -374,29 +374,6 @@ static inline uint64_t sum_bytes_u8(const unsigned char *p, unsigned xn) {
        + (uint64_t)_mm256_extract_epi64(acc, 2) + (uint64_t)_mm256_extract_epi64(acc, 3);
 }
 
-// Same SAD over `xn` bytes but returns the un-reduced 4×u64 partial sums, so the
-// caller can accumulate across blocks (bucketed by b) and hsum ONCE at the end —
-// avoiding a per-exception-block horizontal reduce (4× vpextrq, port-5, latency
-// chain) which is the dominant byte-decode cost.
-static inline __m256i sad_bytes_u8(const unsigned char *p, unsigned xn) {
-  __m256i acc = _mm256_setzero_si256();
-  const __m256i z = _mm256_setzero_si256();
-  unsigned k = 0;
-  for (; k + 32 <= xn; k += 32)
-    acc = _mm256_add_epi64(acc, _mm256_sad_epu8(_mm256_loadu_si256((const __m256i *)(p + k)), z));
-  unsigned r = xn - k;
-  if (r) {
-    static const signed char kIota[32] = {
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-        16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31};
-    __m256i v = _mm256_loadu_si256((const __m256i *)(p + k));
-    __m256i mask = _mm256_cmpgt_epi8(_mm256_set1_epi8((char)r),
-                                     _mm256_loadu_si256((const __m256i *)kIota));
-    acc = _mm256_add_epi64(acc, _mm256_sad_epu8(_mm256_and_si256(v, mask), z));
-  }
-  return acc;
-}
-
 // SIMD sum of the first `xn` uint16 in ex[] (widen to u32). Bulk 16-at-a-time +
 // scalar tail (never reads past ex[xn], so bitunpack16's slack stays untouched).
 static inline uint64_t sum_excess_u16(const uint16_t *ex, unsigned xn) {
@@ -436,12 +413,6 @@ uint32_t p4ndec256v16_sum_fast(const unsigned char *in, unsigned n) {
   uint64_t exc_acc = 0;                       // Σ over blocks of (Σ excess)<<b
   static __thread uint16_t scratch[BLK];
   static __thread uint16_t ex[BLK + 16];
-#if defined(PFOR_BYTE_EXC) && !defined(PFOR_SKIP_EXC)
-  // Defer the per-block excess hsum: accumulate each block's SAD (4×u64) into a
-  // bucket keyed by b, reduce all 17 buckets once at the end.
-  __m256i exc_bucket[17];
-  for (int _i = 0; _i < 17; ++_i) exc_bucket[_i] = _mm256_setzero_si256();
-#endif
 
   const unsigned full = n & ~(unsigned)(BLK - 1);
   for (unsigned base = 0; base < full; base += BLK) {
@@ -475,13 +446,10 @@ uint32_t p4ndec256v16_sum_fast(const unsigned char *in, unsigned n) {
       // With PFOR_SKIP_EXC *also* set: skip the byte-sum but keep the byte stream
       // — the FAIR floor for BYTE (same encoding, exceptions free).
   #ifndef PFOR_SKIP_EXC
-      if (bxe <= 8u) {  // bucket the SAD; hsum deferred to the end
-        exc_bucket[b] = _mm256_add_epi64(exc_bucket[b], sad_bytes_u8((const unsigned char *)ip, xn));
-        ip += xn;
-      } else {          // bxe>8 (rare): uint16 excess, reduce inline
-        exc_acc += sum_excess_u16((const uint16_t *)ip, xn) << b;
-        ip += (size_t)xn * 2u;
-      }
+      uint64_t es;
+      if (bxe <= 8u) { es = sum_bytes_u8((const unsigned char *)ip, xn); ip += xn; }
+      else           { es = sum_excess_u16((const uint16_t *)ip, xn); ip += (size_t)xn * 2u; }
+      exc_acc += es << b;
   #else
       ip += (bxe <= 8u) ? xn : (size_t)xn * 2u;
   #endif
@@ -515,15 +483,6 @@ uint32_t p4ndec256v16_sum_fast(const unsigned char *in, unsigned n) {
     ip += 2;
     exc_acc += v;
   }
-
-#if defined(PFOR_BYTE_EXC) && !defined(PFOR_SKIP_EXC)
-  for (int bb = 0; bb <= 16; ++bb) {  // reduce the per-b SAD buckets once
-    __m128i blo = _mm256_castsi256_si128(exc_bucket[bb]);
-    __m128i bhi = _mm256_extracti128_si256(exc_bucket[bb], 1);
-    __m128i bs = _mm_add_epi64(blo, bhi);
-    exc_acc += ((uint64_t)_mm_extract_epi64(bs, 0) + (uint64_t)_mm_extract_epi64(bs, 1)) << bb;
-  }
-#endif
 
   __m128i lo = _mm256_castsi256_si128(sum);
   __m128i hi = _mm256_extracti128_si256(sum, 1);
