@@ -497,6 +497,91 @@ uint32_t p4ndec256v16_sum_fast(const unsigned char *in, unsigned n) {
   return (uint32_t)_mm_cvtsi128_si32(s) + (uint32_t)exc_acc;
 }
 
+// Unpack-widen twin of p4ndec256v16_sum_fast: identical factored exception sum
+// (excess summed separately), but the low-bit plane is aggregated with the
+// unpack-widen kernel (simdunpack_u16_il, port 5, unsigned-correct for any value)
+// instead of madd. Used by the nobc+unpack path so the BYTE factored codec has a
+// non-madd aggregate (for >2^15 residuals, and for fair madd-vs-unpack A/B).
+uint32_t p4ndec256v16_sum_fast_unpack(const unsigned char *in, unsigned n) {
+  const unsigned char *ip = in;
+  __m256i sum = _mm256_setzero_si256();
+  uint64_t exc_acc = 0;
+  static __thread uint16_t scratch[BLK];
+  static __thread uint16_t ex[BLK + 16];
+
+  const unsigned full = n & ~(unsigned)(BLK - 1);
+  for (unsigned base = 0; base < full; base += BLK) {
+    const unsigned ctrl = *ip++;
+    const unsigned mode = (ctrl >> 5) & 3u;
+    const unsigned b = ctrl & 0x1f;
+
+    if (mode == M_CONST) {
+      uint16_t val = (uint16_t)((unsigned)ip[0] | ((unsigned)ip[1] << 8));
+      ip += 2;
+      exc_acc += (uint64_t)BLK * val;
+      continue;
+    }
+    if (mode == M_PLAIN) {
+      const __m256i *low = (const __m256i *)ip;
+      ip += (size_t)b * 32u;
+      simdunpack_u16_il(low, scratch, b, &sum);
+      continue;
+    }
+
+    if (mode == M_BITMAP) {
+      const unsigned bxe = *ip++;
+      const unsigned char *bm = ip; ip += 32;
+      unsigned xn = 0;
+      for (int w = 0; w < 4; ++w) {
+        uint64_t bits; memcpy(&bits, bm + (size_t)w * 8, 8);
+        xn += (unsigned)__builtin_popcountll(bits);
+      }
+#if defined(PFOR_BYTE_EXC)
+  #ifndef PFOR_SKIP_EXC
+      uint64_t es;
+      if (bxe <= 8u) { es = sum_bytes_u8((const unsigned char *)ip, xn); ip += xn; }
+      else           { es = sum_excess_u16((const uint16_t *)ip, xn); ip += (size_t)xn * 2u; }
+      exc_acc += es << b;
+  #else
+      ip += (bxe <= 8u) ? xn : (size_t)xn * 2u;
+  #endif
+      const __m256i *low = (const __m256i *)ip; ip += (size_t)b * 32u;
+      simdunpack_u16_il(low, scratch, b, &sum);
+#elif !defined(PFOR_SKIP_EXC)
+      ip = bitunpack16(ip, xn, ex, bxe);
+      const __m256i *low = (const __m256i *)ip; ip += (size_t)b * 32u;
+      exc_acc += sum_excess_u16(ex, xn) << b;
+      simdunpack_u16_il(low, scratch, b, &sum);
+#else
+      ip += (((size_t)xn * bxe) + 7u) >> 3;
+      const __m256i *low = (const __m256i *)ip; ip += (size_t)b * 32u;
+      simdunpack_u16_il(low, scratch, b, &sum);
+#endif
+    } else {  // M_VBYTE
+      const unsigned xn = *ip++;
+      const __m256i *low = (const __m256i *)ip; ip += (size_t)b * 32u;
+      ip = vbdec16((unsigned char *)ip, xn, ex);
+      ip += xn;
+      exc_acc += sum_excess_u16(ex, xn) << b;
+      simdunpack_u16_il(low, scratch, b, &sum);
+    }
+  }
+
+  const unsigned tail = n - full;
+  for (unsigned i = 0; i < tail; ++i) {
+    uint16_t v = (uint16_t)((unsigned)ip[0] | ((unsigned)ip[1] << 8));
+    ip += 2;
+    exc_acc += v;
+  }
+
+  __m128i lo = _mm256_castsi256_si128(sum);
+  __m128i hi = _mm256_extracti128_si256(sum, 1);
+  __m128i s = _mm_add_epi32(lo, hi);
+  s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(1, 0, 3, 2)));
+  s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(2, 3, 0, 1)));
+  return (uint32_t)_mm_cvtsi128_si32(s) + (uint32_t)exc_acc;
+}
+
 // Conservative compressed-size bound: no block exceeds PLAIN at b=16 (1 ctrl +
 // 512 lowbits = 513), exception modes are only chosen when smaller. Tail <=
 // (BLK-1)*2, plus the 32-byte over-read pad. 2*n covers the 512/block bulk.
