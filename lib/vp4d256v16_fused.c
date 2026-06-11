@@ -350,18 +350,28 @@ uint32_t p4ndec256v16_sum_madd(const unsigned char *in, unsigned n) {
 }
 
 // SIMD sum of `xn` raw uint8 (byte-aligned excess). vpsadbw against zero sums each
-// 8-byte group into a 64-bit lane (one cheap op/32 bytes); scalar tail. Branchless,
-// no per-value parsing — the whole point of byte-aligned excess.
+// 8-byte group into a 64-bit lane (one cheap op/32 bytes). The <32 remainder is a
+// MASKED sad (not a scalar loop) — the scalar tail dominated at moderate density
+// (xn<32 → every exception summed by hand). Over-reads up to 31 B into the next
+// block / 32-byte end-pad (valid memory); masked lanes (>= r) contribute 0.
 static inline uint64_t sum_bytes_u8(const unsigned char *p, unsigned xn) {
   __m256i acc = _mm256_setzero_si256();
   const __m256i z = _mm256_setzero_si256();
   unsigned k = 0;
   for (; k + 32 <= xn; k += 32)
     acc = _mm256_add_epi64(acc, _mm256_sad_epu8(_mm256_loadu_si256((const __m256i *)(p + k)), z));
-  uint64_t total = (uint64_t)_mm256_extract_epi64(acc, 0) + (uint64_t)_mm256_extract_epi64(acc, 1)
-                 + (uint64_t)_mm256_extract_epi64(acc, 2) + (uint64_t)_mm256_extract_epi64(acc, 3);
-  for (; k < xn; ++k) total += p[k];
-  return total;
+  unsigned r = xn - k;  // 0..31 leftover
+  if (r) {
+    static const signed char kIota[32] = {
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+        16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31};
+    __m256i v = _mm256_loadu_si256((const __m256i *)(p + k));
+    __m256i mask = _mm256_cmpgt_epi8(_mm256_set1_epi8((char)r),
+                                     _mm256_loadu_si256((const __m256i *)kIota));
+    acc = _mm256_add_epi64(acc, _mm256_sad_epu8(_mm256_and_si256(v, mask), z));
+  }
+  return (uint64_t)_mm256_extract_epi64(acc, 0) + (uint64_t)_mm256_extract_epi64(acc, 1)
+       + (uint64_t)_mm256_extract_epi64(acc, 2) + (uint64_t)_mm256_extract_epi64(acc, 3);
 }
 
 // SIMD sum of the first `xn` uint16 in ex[] (widen to u32). Bulk 16-at-a-time +
