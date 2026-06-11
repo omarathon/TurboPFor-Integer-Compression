@@ -309,7 +309,12 @@ uint32_t p4ndec256v16_sum_madd(const unsigned char *in, unsigned n) {
         uint64_t bits; memcpy(&bits, bm + (size_t)w * 8, 8);
         xn += (unsigned)__builtin_popcountll(bits);
       }
-#ifndef PFOR_SKIP_EXC
+#if defined(PFOR_BYTE_EXC) && !defined(PFOR_SKIP_EXC)
+      // Byte excess widened into ex[]; the pshufb merge below folds it into OutReg
+      // positionally (general — works for min/max/NDVI/multiply, not just sum).
+      if (bxe <= 8u) { for (unsigned t = 0; t < xn; ++t) ex[t] = ((const unsigned char *)ip)[t]; ip += xn; }
+      else           { memcpy(ex, ip, (size_t)xn * 2u); ip += (size_t)xn * 2u; }
+#elif !defined(PFOR_SKIP_EXC)
       ip = bitunpack16(ip, xn, ex, bxe);
 #else
       ip += (((size_t)xn * bxe) + 7u) >> 3;  // skip excess; low-unpack only below
