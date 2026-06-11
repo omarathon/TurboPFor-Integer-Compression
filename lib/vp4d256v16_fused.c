@@ -84,7 +84,11 @@ size_t p4nenc256v16(uint16_t *in, size_t n, unsigned char *out) {
     size_t best_cost = 1u + (size_t)32u * maxbits;  // ctrl + lowbits
     for (int b = (int)maxbits - 1; b >= 0; --b) {
       unsigned xn = xn_b[b], bxe = maxbits - (unsigned)b;
+#ifdef PFOR_BYTE_EXC
+      size_t bm = 1u + 32u + (size_t)xn * (bxe <= 8u ? 1u : 2u);  // byte-aligned excess
+#else
       size_t bm = 1u + 32u + pad8((size_t)xn * bxe);          // bx + bitmap + excess
+#endif
       unsigned vbe = bxe <= 7 ? 1u : (bxe <= 14 ? 2u : 3u);   // vbyte bytes/excess (est.)
       size_t vb = 1u + (size_t)xn * vbe + xn;                 // xn + excess + positions
       size_t pos = bm < vb ? bm : vb;
@@ -125,13 +129,22 @@ size_t p4nenc256v16(uint16_t *in, size_t n, unsigned char *out) {
     const size_t vbyte_excess_sz = (size_t)(vbend - vbexc);
     const size_t bitmap_sz = 1u + 32u + pad8((size_t)xn * bxe);
     const size_t vbyte_sz  = 1u + vbyte_excess_sz + xn;
+#if defined(PFOR_BYTE_EXC) || defined(PFOR_SKIP_EXC)
+    const int use_vbyte = 0;  // byte/skip paths only implement BITMAP
+#else
     const int use_vbyte = (xn <= 255) && (vbyte_sz < bitmap_sz);
+#endif
 
     if (!use_vbyte) {  // ── BITMAP
       *op++ = (unsigned char)((M_BITMAP << 5) | (b & 0x1f));
       *op++ = (unsigned char)bxe;
       memcpy(op, bitmap, 32); op += 32;
+#ifdef PFOR_BYTE_EXC
+      if (bxe <= 8u) { for (unsigned t = 0; t < xn; ++t) op[t] = (unsigned char)excess[t]; op += xn; }
+      else           { memcpy(op, excess, (size_t)xn * 2u); op += (size_t)xn * 2u; }
+#else
       op = bitpack16(excess, xn, op, bxe);
+#endif
       if (b) {
         simdpack_u16(masked, packed, b);
         memcpy(op, packed, (size_t)b * 32u); op += (size_t)b * 32u;
@@ -223,7 +236,12 @@ uint32_t p4ndec256v16_sum(const unsigned char *in, unsigned n) {
         uint64_t bits; memcpy(&bits, bm + (size_t)w * 8, 8);
         xn += (unsigned)__builtin_popcountll(bits);
       }
+#ifdef PFOR_BYTE_EXC
+      if (bxe <= 8u) { for (unsigned t = 0; t < xn; ++t) ex[t] = ((const unsigned char *)ip)[t]; ip += xn; }
+      else           { memcpy(ex, ip, (size_t)xn * 2u); ip += (size_t)xn * 2u; }
+#else
       ip = bitunpack16(ip, xn, ex, bxe);   // excess, advances past packed bits
+#endif
       low = (const __m256i *)ip; ip += (size_t)b * 32u;
       bm16 = (const uint16_t *)bm;          // 256-bit bitmap as 16 u16 words
     } else {  // M_VBYTE
