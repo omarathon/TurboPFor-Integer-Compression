@@ -436,6 +436,215 @@ static inline uint16_t read_u16le(const uint8_t *p) {
   return (uint16_t)((unsigned)p[0] | ((unsigned)p[1] << 8));
 }
 
+// ── SIMD exception sum (mirrors vp4d256v16_fused.c sum_excess_u16) ───────────
+// Widens uint16 excess values to uint32 and reduces: 16-at-a-time AVX2 loop.
+// Works for both bit-packed excess (uint16) and byte-aligned excess stored as
+// uint16 (PFOR_BYTE_EXC path copies uint8→uint16 zero-extended, still valid).
+static inline uint64_t sum_excess_u16(const uint16_t *ex, unsigned xn) {
+  __m256i acc = _mm256_setzero_si256();
+  const __m256i z = _mm256_setzero_si256();
+  unsigned k = 0;
+  for (; k + 16 <= xn; k += 16) {
+    __m256i v = _mm256_loadu_si256((const __m256i *)(ex + k));
+    acc = _mm256_add_epi32(acc, _mm256_unpacklo_epi16(v, z));
+    acc = _mm256_add_epi32(acc, _mm256_unpackhi_epi16(v, z));
+  }
+  __m128i lo = _mm256_castsi256_si128(acc);
+  __m128i hi = _mm256_extracti128_si256(acc, 1);
+  __m128i s  = _mm_add_epi32(lo, hi);
+  s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(1, 0, 3, 2)));
+  s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(2, 3, 0, 1)));
+  uint64_t total = (uint32_t)_mm_cvtsi128_si32(s);
+  for (; k < xn; ++k) total += ex[k];
+  return total;
+}
+
+// ── fine-window FoR kernel variants ───────────────────────────────────────────
+//
+// Three granularities:
+//   csc  (w=16..256): one anchor per OutReg; caller expands to 16-entry array.
+//   half (w=8):       two anchors per OutReg; lower 8 lanes get ancs[2J],
+//                     upper 8 lanes get ancs[2J+1].
+//   qtr  (w=4):       four anchors per OutReg; groups of 4 lanes each.
+//
+// Dispatch signature takes the anchor array pointer; size implied by granularity.
+
+// ── csc: one anchor per OutReg ────────────────────────────────────────────────
+template <int OP, int B>
+__attribute__((noinline)) static void sub_plain2_csc(
+    const __m256i *lowA, const __m256i *lowB,
+    const uint16_t *ancsA, const uint16_t *ancsB,
+    __m256i *accx) {
+  __m256i x = *accx;
+  [&]<int... J>(std::integer_sequence<int, J...>) {
+    (([&] {
+      __m256i va = _mm256_add_epi16(ex<B, J>(lowA), _mm256_set1_epi16((short)ancsA[J]));
+      __m256i vb = _mm256_add_epi16(ex<B, J>(lowB), _mm256_set1_epi16((short)ancsB[J]));
+      acc_op2<OP>(va, vb, x);
+    }()), ...);
+  }(std::make_integer_sequence<int, 16>{});
+  *accx = x;
+}
+
+template <int OP, int B>
+__attribute__((noinline)) static void sub_pfor2_csc(
+    const __m256i *lowA, const uint16_t *exA, const uint16_t *bm16A,
+    const __m256i *lowB, const uint16_t *exB, const uint16_t *bm16B,
+    const uint16_t *ancsA, const uint16_t *ancsB,
+    __m256i *accx) {
+  __m256i x = *accx;
+  const uint16_t *_pA = exA, *_pB = exB;
+  [&]<int... J>(std::integer_sequence<int, J...>) {
+    (([&] {
+      __m256i va = ex<B, J>(lowA);
+      PFOR_MERGE_J(va, _pA, bm16A[J], B);
+      va = _mm256_add_epi16(va, _mm256_set1_epi16((short)ancsA[J]));
+      __m256i vb = ex<B, J>(lowB);
+      PFOR_MERGE_J(vb, _pB, bm16B[J], B);
+      vb = _mm256_add_epi16(vb, _mm256_set1_epi16((short)ancsB[J]));
+      acc_op2<OP>(va, vb, x);
+    }()), ...);
+  }(std::make_integer_sequence<int, 16>{});
+  *accx = x;
+}
+
+// ── half: two anchors per OutReg (w=8) ───────────────────────────────────────
+template <int OP, int B>
+__attribute__((noinline)) static void sub_plain2_half(
+    const __m256i *lowA, const __m256i *lowB,
+    const uint16_t *ancsA, const uint16_t *ancsB,
+    __m256i *accx) {
+  __m256i x = *accx;
+  [&]<int... J>(std::integer_sequence<int, J...>) {
+    (([&] {
+      __m256i bcA = _mm256_set_m128i(_mm_set1_epi16((short)ancsA[2*J+1]),
+                                      _mm_set1_epi16((short)ancsA[2*J]));
+      __m256i bcB = _mm256_set_m128i(_mm_set1_epi16((short)ancsB[2*J+1]),
+                                      _mm_set1_epi16((short)ancsB[2*J]));
+      __m256i va = _mm256_add_epi16(ex<B, J>(lowA), bcA);
+      __m256i vb = _mm256_add_epi16(ex<B, J>(lowB), bcB);
+      acc_op2<OP>(va, vb, x);
+    }()), ...);
+  }(std::make_integer_sequence<int, 16>{});
+  *accx = x;
+}
+
+template <int OP, int B>
+__attribute__((noinline)) static void sub_pfor2_half(
+    const __m256i *lowA, const uint16_t *exA, const uint16_t *bm16A,
+    const __m256i *lowB, const uint16_t *exB, const uint16_t *bm16B,
+    const uint16_t *ancsA, const uint16_t *ancsB,
+    __m256i *accx) {
+  __m256i x = *accx;
+  const uint16_t *_pA = exA, *_pB = exB;
+  [&]<int... J>(std::integer_sequence<int, J...>) {
+    (([&] {
+      __m256i bcA = _mm256_set_m128i(_mm_set1_epi16((short)ancsA[2*J+1]),
+                                      _mm_set1_epi16((short)ancsA[2*J]));
+      __m256i bcB = _mm256_set_m128i(_mm_set1_epi16((short)ancsB[2*J+1]),
+                                      _mm_set1_epi16((short)ancsB[2*J]));
+      __m256i va = ex<B, J>(lowA);
+      PFOR_MERGE_J(va, _pA, bm16A[J], B);
+      va = _mm256_add_epi16(va, bcA);
+      __m256i vb = ex<B, J>(lowB);
+      PFOR_MERGE_J(vb, _pB, bm16B[J], B);
+      vb = _mm256_add_epi16(vb, bcB);
+      acc_op2<OP>(va, vb, x);
+    }()), ...);
+  }(std::make_integer_sequence<int, 16>{});
+  *accx = x;
+}
+
+// ── qtr: four anchors per OutReg (w=4) ───────────────────────────────────────
+// OutReg J: lanes 0-3 = ancs[4J], lanes 4-7 = ancs[4J+1],
+//           lanes 8-11 = ancs[4J+2], lanes 12-15 = ancs[4J+3].
+template <int OP, int B>
+__attribute__((noinline)) static void sub_plain2_qtr(
+    const __m256i *lowA, const __m256i *lowB,
+    const uint16_t *ancsA, const uint16_t *ancsB,
+    __m256i *accx) {
+  __m256i x = *accx;
+  [&]<int... J>(std::integer_sequence<int, J...>) {
+    (([&] {
+      __m256i bcA = _mm256_set_m128i(
+          _mm_setr_epi16((short)ancsA[4*J+2],(short)ancsA[4*J+2],(short)ancsA[4*J+2],(short)ancsA[4*J+2],
+                         (short)ancsA[4*J+3],(short)ancsA[4*J+3],(short)ancsA[4*J+3],(short)ancsA[4*J+3]),
+          _mm_setr_epi16((short)ancsA[4*J+0],(short)ancsA[4*J+0],(short)ancsA[4*J+0],(short)ancsA[4*J+0],
+                         (short)ancsA[4*J+1],(short)ancsA[4*J+1],(short)ancsA[4*J+1],(short)ancsA[4*J+1]));
+      __m256i bcB = _mm256_set_m128i(
+          _mm_setr_epi16((short)ancsB[4*J+2],(short)ancsB[4*J+2],(short)ancsB[4*J+2],(short)ancsB[4*J+2],
+                         (short)ancsB[4*J+3],(short)ancsB[4*J+3],(short)ancsB[4*J+3],(short)ancsB[4*J+3]),
+          _mm_setr_epi16((short)ancsB[4*J+0],(short)ancsB[4*J+0],(short)ancsB[4*J+0],(short)ancsB[4*J+0],
+                         (short)ancsB[4*J+1],(short)ancsB[4*J+1],(short)ancsB[4*J+1],(short)ancsB[4*J+1]));
+      __m256i va = _mm256_add_epi16(ex<B, J>(lowA), bcA);
+      __m256i vb = _mm256_add_epi16(ex<B, J>(lowB), bcB);
+      acc_op2<OP>(va, vb, x);
+    }()), ...);
+  }(std::make_integer_sequence<int, 16>{});
+  *accx = x;
+}
+
+template <int OP, int B>
+__attribute__((noinline)) static void sub_pfor2_qtr(
+    const __m256i *lowA, const uint16_t *exA, const uint16_t *bm16A,
+    const __m256i *lowB, const uint16_t *exB, const uint16_t *bm16B,
+    const uint16_t *ancsA, const uint16_t *ancsB,
+    __m256i *accx) {
+  __m256i x = *accx;
+  const uint16_t *_pA = exA, *_pB = exB;
+  [&]<int... J>(std::integer_sequence<int, J...>) {
+    (([&] {
+      __m256i bcA = _mm256_set_m128i(
+          _mm_setr_epi16((short)ancsA[4*J+2],(short)ancsA[4*J+2],(short)ancsA[4*J+2],(short)ancsA[4*J+2],
+                         (short)ancsA[4*J+3],(short)ancsA[4*J+3],(short)ancsA[4*J+3],(short)ancsA[4*J+3]),
+          _mm_setr_epi16((short)ancsA[4*J+0],(short)ancsA[4*J+0],(short)ancsA[4*J+0],(short)ancsA[4*J+0],
+                         (short)ancsA[4*J+1],(short)ancsA[4*J+1],(short)ancsA[4*J+1],(short)ancsA[4*J+1]));
+      __m256i bcB = _mm256_set_m128i(
+          _mm_setr_epi16((short)ancsB[4*J+2],(short)ancsB[4*J+2],(short)ancsB[4*J+2],(short)ancsB[4*J+2],
+                         (short)ancsB[4*J+3],(short)ancsB[4*J+3],(short)ancsB[4*J+3],(short)ancsB[4*J+3]),
+          _mm_setr_epi16((short)ancsB[4*J+0],(short)ancsB[4*J+0],(short)ancsB[4*J+0],(short)ancsB[4*J+0],
+                         (short)ancsB[4*J+1],(short)ancsB[4*J+1],(short)ancsB[4*J+1],(short)ancsB[4*J+1]));
+      __m256i va = ex<B, J>(lowA);
+      PFOR_MERGE_J(va, _pA, bm16A[J], B);
+      va = _mm256_add_epi16(va, bcA);
+      __m256i vb = ex<B, J>(lowB);
+      PFOR_MERGE_J(vb, _pB, bm16B[J], B);
+      vb = _mm256_add_epi16(vb, bcB);
+      acc_op2<OP>(va, vb, x);
+    }()), ...);
+  }(std::make_integer_sequence<int, 16>{});
+  *accx = x;
+}
+
+// dispatch tables for fine-window FoR kernels
+using PlainFnAnc = void (*)(const __m256i *, const __m256i *,
+                            const uint16_t *, const uint16_t *, __m256i *);
+using PforFnAnc  = void (*)(const __m256i *, const uint16_t *, const uint16_t *,
+                            const __m256i *, const uint16_t *, const uint16_t *,
+                            const uint16_t *, const uint16_t *, __m256i *);
+
+static PlainFnAnc g_plain_csc[2][17], g_plain_half[2][17], g_plain_qtr[2][17];
+static PforFnAnc  g_pfor_csc[2][17],  g_pfor_half[2][17],  g_pfor_qtr[2][17];
+
+template <int OP, int B>
+static void reg_b_anc() {
+  g_plain_csc[OP][B]  = &sub_plain2_csc<OP, B>;
+  g_pfor_csc[OP][B]   = &sub_pfor2_csc<OP, B>;
+  g_plain_half[OP][B] = &sub_plain2_half<OP, B>;
+  g_pfor_half[OP][B]  = &sub_pfor2_half<OP, B>;
+  g_plain_qtr[OP][B]  = &sub_plain2_qtr<OP, B>;
+  g_pfor_qtr[OP][B]   = &sub_pfor2_qtr<OP, B>;
+}
+template <int OP>
+static void reg_op_anc() {
+  []<int... B>(std::integer_sequence<int, B...>) {
+    (reg_b_anc<OP, B>(), ...);
+  }(std::make_integer_sequence<int, 17>{});
+}
+struct Init2 {
+  Init2() { reg_op_anc<OP_NOOP>(); reg_op_anc<OP_ADD>(); }
+} g_init2;
+
 }  // namespace
 
 // ── encoder ──────────────────────────────────────────────────────────────────
@@ -734,9 +943,8 @@ extern "C" double ndvi2_pfor_for_indep(
       // match the full-merge path — this is a timing diagnostic for the pshufb merge cost.
       if (op == OP_ADD) {
         g_plain_tbl[OP_ADD][b](lowA, lowB, ancA, ancB, &accx);
-        int32_t exc_sum = 0;
-        for (unsigned k = 0; k < xnA; ++k) exc_sum += (int32_t)exA[k] << b;
-        for (unsigned k = 0; k < xnB; ++k) exc_sum += (int32_t)exB[k] << b;
+        uint64_t es = sum_excess_u16(exA, xnA) + sum_excess_u16(exB, xnB);
+        int32_t exc_sum = (int32_t)((int64_t)es << b);
         accx = _mm256_add_epi32(accx, _mm256_set_epi32(0,0,0,0,0,0,0,exc_sum));
       } else {
         g_pfor_tbl[op][b](lowA, exA, bm16A, lowB, exB, bm16B, ancA, ancB, &accx);
@@ -759,6 +967,216 @@ extern "C" double ndvi2_pfor_for_indep(
 
   // XOR-fold reduction: same formula as ndvi2_indep's xreduce() so that the
   // bench 'result' field matches simdcomp_fused for correctness cross-checking.
+  alignas(32) int32_t v[8];
+  _mm256_store_si256((__m256i*)v, accx);
+  int64_t r = 0;
+  for (int i = 0; i < 8; ++i) r ^= v[i];
+  return (double)(r & 0xFFFF);
+}
+
+// ── fine-window FoR encoder ───────────────────────────────────────────────────
+// Per-window anchor = min of each w-element group within the 256-element block.
+// anchorsA/B: caller allocates ceil(n/w) + BLK/w entries each.
+// Payload streams are identical in format to p4nenc256v16_for2band.
+extern "C" void p4nenc256v16_for2band_w(
+    const uint16_t *inA, const uint16_t *inB, size_t n, unsigned w,
+    uint16_t *anchorsA, uint16_t *anchorsB,
+    uint8_t *outA, size_t *sizeA,
+    uint8_t *outB, size_t *sizeB) {
+  uint8_t *opA = outA, *opB = outB;
+  uint16_t resA[BLK], resB[BLK];
+  const size_t apb = BLK / w;
+
+  const size_t full = n & ~(size_t)(BLK - 1);
+  for (size_t base = 0; base < full; base += BLK) {
+    const uint16_t *blkA = inA + base, *blkB = inB + base;
+
+    unsigned uA = 0, uB = 0;
+    for (size_t win = 0; win < apb; ++win) {
+      const uint16_t *wA = blkA + win * w, *wB = blkB + win * w;
+      uint16_t aA = wA[0], aB = wB[0];
+      for (unsigned i = 1; i < w; ++i) {
+        if (wA[i] < aA) aA = wA[i];
+        if (wB[i] < aB) aB = wB[i];
+      }
+      *anchorsA++ = aA;
+      *anchorsB++ = aB;
+      for (unsigned i = 0; i < w; ++i) {
+        resA[win * w + i] = (uint16_t)(wA[i] - aA);
+        resB[win * w + i] = (uint16_t)(wB[i] - aB);
+        uA |= resA[win * w + i];
+        uB |= resB[win * w + i];
+      }
+    }
+    const unsigned maxbitsA = bitlen16(uA), maxbitsB = bitlen16(uB);
+
+    auto best_b = [&](const uint16_t *res, unsigned maxbits) -> unsigned {
+      unsigned cnt[18]; memset(cnt, 0, sizeof(cnt));
+      for (int i = 0; i < BLK; ++i) cnt[bitlen16(res[i])]++;
+      unsigned xn_b[17]; xn_b[16] = 0;
+      for (int b = 15; b >= 0; --b) xn_b[b] = xn_b[b+1] + cnt[b+1];
+      unsigned best = maxbits;
+      size_t bcost = 1u + (size_t)32u * maxbits;
+      for (int b = (int)maxbits - 1; b >= 0; --b) {
+        unsigned xn = xn_b[b], bxe = maxbits - (unsigned)b;
+        size_t bm = 1u + 32u + pad8((size_t)xn * bxe);
+        unsigned vbe = bxe <= 7 ? 1u : (bxe <= 14 ? 2u : 3u);
+        size_t vb = 1u + (size_t)xn * vbe + xn;
+        size_t pos = bm < vb ? bm : vb;
+        size_t cost = 1u + (size_t)32u * (unsigned)b + pos;
+        if (cost < bcost) { bcost = cost; best = (unsigned)b; }
+      }
+      return best;
+    };
+
+    const unsigned bA = best_b(resA, maxbitsA);
+    const unsigned bB = best_b(resB, maxbitsB);
+    const unsigned b  = (bA > bB) ? bA : bB;
+
+    opA = encode_block_at_b(resA, b, maxbitsA, opA);
+    opB = encode_block_at_b(resB, b, maxbitsB, opB);
+  }
+
+  const size_t tail = n - full;
+  if (tail) {
+    memcpy(opA, inA + full, tail * sizeof(uint16_t)); opA += tail * sizeof(uint16_t);
+    memcpy(opB, inB + full, tail * sizeof(uint16_t)); opB += tail * sizeof(uint16_t);
+  }
+  memset(opA, 0, 32); opA += 32;
+  memset(opB, 0, 32); opB += 32;
+
+  *sizeA = (size_t)(opA - outA);
+  *sizeB = (size_t)(opB - outB);
+}
+
+extern "C" size_t p4nbound256v16_for2band_w(size_t n) {
+  return p4nbound256v16_for2band(n);
+}
+
+// ── fine-window FoR fused lockstep decoder ───────────────────────────────────
+// w=16..256: expands to 16 per-OutReg anchors (csc kernels).
+// w=8:       half mode — 2 anchors per OutReg (half kernels).
+// w=4:       quarter mode — 4 anchors per OutReg (qtr kernels).
+extern "C" double ndvi2_pfor_for_indep_w(
+    const uint8_t *encA, const uint16_t *anchorsA,
+    const uint8_t *encB, const uint16_t *anchorsB,
+    size_t n, unsigned w, int op) {
+  static const uint16_t zero_bm[16] = {};
+  __m256i accx = _mm256_setzero_si256();
+  const uint8_t *ipA = encA, *ipB = encB;
+  const size_t apb = BLK / w;
+
+  const size_t full = n & ~(size_t)(BLK - 1);
+  for (size_t base = 0; base < full; base += BLK) {
+    const uint16_t *anc_blkA = anchorsA; anchorsA += apb;
+    const uint16_t *anc_blkB = anchorsB; anchorsB += apb;
+
+    // Expand to 16 per-OutReg anchors for w >= 16
+    uint16_t ancs16A[16], ancs16B[16];
+    if (w >= 16u) {
+      const unsigned orpu = w / 16u;  // OutRegs sharing one window anchor
+      for (unsigned j = 0; j < 16u; ++j) {
+        ancs16A[j] = anc_blkA[j / orpu];
+        ancs16B[j] = anc_blkB[j / orpu];
+      }
+    }
+
+    const unsigned ctrlA = *ipA++, ctrlB = *ipB++;
+    const unsigned modeA = (ctrlA >> 5) & 3u;
+    const unsigned modeB = (ctrlB >> 5) & 3u;
+    const unsigned b     = ctrlA & 0x1fu;
+
+    // ── PLAIN fast path (no exceptions) ───────────────────────────────────
+    if (modeA == M_PLAIN && modeB == M_PLAIN) {
+      const __m256i *lowA = (const __m256i *)ipA; ipA += (size_t)b * 32u;
+      const __m256i *lowB = (const __m256i *)ipB; ipB += (size_t)b * 32u;
+      if (w >= 16u)
+        g_plain_csc[op][b](lowA, lowB, ancs16A, ancs16B, &accx);
+      else if (w == 8u)
+        g_plain_half[op][b](lowA, lowB, anc_blkA, anc_blkB, &accx);
+      else
+        g_plain_qtr[op][b](lowA, lowB, anc_blkA, anc_blkB, &accx);
+      continue;
+    }
+
+    // ── Exception path ────────────────────────────────────────────────────
+    {
+      uint16_t exA[BLK + 16], exB[BLK + 16];
+      const __m256i *lowA, *lowB;
+      const uint16_t *bm16A = zero_bm, *bm16B = zero_bm;
+
+      if (modeA == M_PLAIN) {
+        lowA = (const __m256i *)ipA; ipA += (size_t)b * 32u;
+      } else if (modeA == M_BITMAP) {
+        const unsigned bxe = *ipA++;
+        const uint8_t *bm = ipA; ipA += 32;
+        const unsigned xn = popcnt32(bm);
+#ifdef PFOR_BYTE_EXC
+        if (bxe <= 8u) { for (unsigned t=0; t<xn; ++t) exA[t] = ((const uint8_t*)ipA)[t]; ipA += xn; }
+        else           { memcpy(exA, ipA, (size_t)xn*2u); ipA += (size_t)xn*2u; }
+#else
+        ipA = (const uint8_t *)bitunpack16(ipA, xn, exA, bxe);
+#endif
+        lowA = (const __m256i *)ipA; ipA += (size_t)b * 32u;
+        bm16A = (const uint16_t *)bm;
+#ifndef PFOR_BYTE_EXC
+      } else {
+        const unsigned xn = *ipA++;
+        lowA = (const __m256i *)ipA; ipA += (size_t)b * 32u;
+        ipA = (const uint8_t *)vbdec16((unsigned char *)ipA, xn, exA);
+        { const uint8_t *pos = ipA; ipA += xn;
+          unsigned char bmbufA[32]; memset(bmbufA, 0, 32);
+          for (unsigned k = 0; k < xn; ++k)
+            bmbufA[pos[k] >> 3] |= (unsigned char)(1u << (pos[k] & 7));
+          bm16A = (const uint16_t *)bmbufA; }
+#endif
+      }
+
+      if (modeB == M_PLAIN) {
+        lowB = (const __m256i *)ipB; ipB += (size_t)b * 32u;
+      } else if (modeB == M_BITMAP) {
+        const unsigned bxe = *ipB++;
+        const uint8_t *bm = ipB; ipB += 32;
+        const unsigned xn = popcnt32(bm);
+#ifdef PFOR_BYTE_EXC
+        if (bxe <= 8u) { for (unsigned t=0; t<xn; ++t) exB[t] = ((const uint8_t*)ipB)[t]; ipB += xn; }
+        else           { memcpy(exB, ipB, (size_t)xn*2u); ipB += (size_t)xn*2u; }
+#else
+        ipB = (const uint8_t *)bitunpack16(ipB, xn, exB, bxe);
+#endif
+        lowB = (const __m256i *)ipB; ipB += (size_t)b * 32u;
+        bm16B = (const uint16_t *)bm;
+#ifndef PFOR_BYTE_EXC
+      } else {
+        const unsigned xn = *ipB++;
+        lowB = (const __m256i *)ipB; ipB += (size_t)b * 32u;
+        ipB = (const uint8_t *)vbdec16((unsigned char *)ipB, xn, exB);
+        { const uint8_t *pos = ipB; ipB += xn;
+          unsigned char bmbufB[32]; memset(bmbufB, 0, 32);
+          for (unsigned k = 0; k < xn; ++k)
+            bmbufB[pos[k] >> 3] |= (unsigned char)(1u << (pos[k] & 7));
+          bm16B = (const uint16_t *)bmbufB; }
+#endif
+      }
+
+      if (w >= 16u)
+        g_pfor_csc[op][b](lowA, exA, bm16A, lowB, exB, bm16B, ancs16A, ancs16B, &accx);
+      else if (w == 8u)
+        g_pfor_half[op][b](lowA, exA, bm16A, lowB, exB, bm16B, anc_blkA, anc_blkB, &accx);
+      else
+        g_pfor_qtr[op][b](lowA, exA, bm16A, lowB, exB, bm16B, anc_blkA, anc_blkB, &accx);
+    }
+  }
+
+  const size_t tail = n - full;
+  for (size_t i = 0; i < tail; ++i) {
+    uint16_t va = read_u16le(ipA); ipA += 2;
+    uint16_t vb = read_u16le(ipB); ipB += 2;
+    if (op == OP_ADD)
+      accx = _mm256_add_epi32(accx,
+          _mm256_set_epi32(0,0,0,0,0,0,0,(int)((uint32_t)va + vb)));
+  }
+
   alignas(32) int32_t v[8];
   _mm256_store_si256((__m256i*)v, accx);
   int64_t r = 0;
