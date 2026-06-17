@@ -467,22 +467,33 @@ static unsigned char *encode_block_at_b(
   const unsigned bxe = maxbits - b;
   unsigned char bitmap[32]; memset(bitmap, 0, 32);
   uint16_t excess[BLK], masked[BLK];
+#ifndef PFOR_BYTE_EXC
   unsigned char posbuf[BLK], vbexc[BLK * 3];
+#endif
   unsigned k = 0;
   for (int i = 0; i < BLK; ++i) {
     masked[i] = (uint16_t)(residuals[i] & mask);
     if (bitlen16(residuals[i]) > b) {
       bitmap[i >> 3] |= (unsigned char)(1u << (i & 7));
       excess[k] = (uint16_t)(residuals[i] >> b);
+#ifndef PFOR_BYTE_EXC
       posbuf[k] = (unsigned char)i;
+#endif
       ++k;
     }
   }
+#ifdef PFOR_BYTE_EXC
+  // Byte-aligned excess: raw uint8 (bxe<=8) or uint16 (bxe>8). Avoids bitpack16
+  // on encode and bitunpack16 on decode; pshufb merge works unchanged since
+  // ex[] values are identical. Force BITMAP only (no VBYTE in byte-exc mode).
+  const int use_vbyte = 0;
+#else
   unsigned char *vbend = vbenc16(excess, xn_total, vbexc);
   const size_t vbyte_excess_sz = (size_t)(vbend - vbexc);
   const size_t bitmap_sz = 1u + 32u + pad8((size_t)xn_total * bxe);
   const size_t vbyte_sz  = 1u + vbyte_excess_sz + xn_total;
   const int use_vbyte = (xn_total <= 255) && (vbyte_sz < bitmap_sz);
+#endif
 
   __m256i packed[16];
   if (b) {
@@ -493,14 +504,23 @@ static unsigned char *encode_block_at_b(
     *op++ = (unsigned char)((M_BITMAP << 5) | (b & 0x1fu));
     *op++ = (unsigned char)bxe;
     memcpy(op, bitmap, 32); op += 32;
+#ifdef PFOR_BYTE_EXC
+    if (bxe <= 8u) { for (unsigned t = 0; t < xn_total; ++t) *op++ = (unsigned char)excess[t]; }
+    else           { memcpy(op, excess, (size_t)xn_total * 2u); op += (size_t)xn_total * 2u; }
+#else
     op = bitpack16(excess, xn_total, op, bxe);
+#endif
     if (b) { memcpy(op, packed, (size_t)b * 32u); op += (size_t)b * 32u; }
+#ifndef PFOR_BYTE_EXC
   } else {
     *op++ = (unsigned char)((M_VBYTE << 5) | (b & 0x1fu));
     *op++ = (unsigned char)xn_total;
     if (b) { memcpy(op, packed, (size_t)b * 32u); op += (size_t)b * 32u; }
     memcpy(op, vbexc, vbyte_excess_sz); op += vbyte_excess_sz;
     memcpy(op, posbuf, xn_total); op += xn_total;
+#else
+  } else { /* unreachable: use_vbyte=0 when PFOR_BYTE_EXC */ __builtin_unreachable();
+#endif
   }
   return op;
 }
@@ -591,130 +611,96 @@ extern "C" double ndvi2_pfor_for_indep(
   static const uint16_t zero_bm[16] = {};
   __m256i accx = _mm256_setzero_si256();
   const uint8_t *ipA = encA, *ipB = encB;
-  uint16_t exA[BLK + 16], exB[BLK + 16];
-  unsigned char bmbufA[32], bmbufB[32];
 
   const size_t full = n & ~(size_t)(BLK - 1);
   for (size_t base = 0; base < full; base += BLK) {
     const uint16_t ancA = *anchorsA++, ancB = *anchorsB++;
 
-    // ── parse block A ──────────────────────────────────────────────────────
-    const unsigned ctrlA = *ipA++;
+    // Both streams are independent byte arrays — read both ctrl bytes first.
+    const unsigned ctrlA = *ipA++, ctrlB = *ipB++;
     const unsigned modeA = (ctrlA >> 5) & 3u;
-    const unsigned b     = ctrlA & 0x1fu;       // shared b (same in ctrl_B)
-    const __m256i *lowA  = nullptr;
-    const uint16_t *bm16A = zero_bm;
-
-    if (modeA == M_PLAIN) {
-      lowA = (const __m256i *)ipA; ipA += (size_t)b * 32u;
-    } else if (modeA == M_BITMAP) {
-      const unsigned bxe = *ipA++;
-      const uint8_t *bm = ipA; ipA += 32;
-      unsigned xn = popcnt32(bm);
-      ipA = (const uint8_t *)bitunpack16(ipA, xn, exA, bxe);
-      lowA = (const __m256i *)ipA; ipA += (size_t)b * 32u;
-      bm16A = (const uint16_t *)bm;
-    } else if (modeA == M_VBYTE) {
-      const unsigned xn = *ipA++;
-      lowA = (const __m256i *)ipA; ipA += (size_t)b * 32u;
-      ipA = (const uint8_t *)vbdec16((unsigned char *)ipA, xn, exA);
-      const uint8_t *pos = ipA; ipA += xn;
-      memset(bmbufA, 0, 32);
-      for (unsigned k = 0; k < xn; ++k)
-        bmbufA[pos[k] >> 3] |= (unsigned char)(1u << (pos[k] & 7));
-      bm16A = (const uint16_t *)bmbufA;
-    } else {  // M_CONST (rare with FoR; handle by treating as PLAIN b=0 value)
-      uint16_t cv = read_u16le(ipA); ipA += 2;
-      // Accumulate 256 copies of (cv + ancA) for band A, leave band B for its
-      // own parse below — handle the mixed case with the constant already known.
-      // We use a local trick: set ancA_eff = cv + ancA, treat as PLAIN b=0 block
-      // (all zeros + anchor = cv+ancA). Falls into PLAIN path with zero lowA.
-      // Since we can't call the kernel without lowA, handle CONST A scalar here.
-      if (op == OP_ADD) {
-        const int32_t corrA = (int32_t)(cv + ancA);
-        accx = _mm256_add_epi32(accx, _mm256_set1_epi32(corrA * (BLK / 8)));
-      }
-      // Skip parsing band B for the kernel; parse it to advance ipB, then continue.
-      const unsigned ctrlB = *ipB++;
-      const unsigned modeB = (ctrlB >> 5) & 3u;
-      const unsigned bB2   = ctrlB & 0x1fu;
-      if (modeB == M_PLAIN) { ipB += (size_t)bB2 * 32u; }
-      else if (modeB == M_BITMAP) {
-        const unsigned bxeB = *ipB++; ipB += 32;
-        unsigned xnB = 0; { const uint8_t *p = ipB - 32; for(int w=0;w<4;w++){uint64_t bits;memcpy(&bits,p+w*8,8);xnB+=__builtin_popcountll(bits);} }
-        ipB = (const uint8_t *)bitunpack16(ipB, xnB, exB, bxeB);
-        ipB += (size_t)bB2 * 32u;
-        if (op == OP_ADD) {
-          uint16_t corrB = (uint16_t)(*anchorsB - 1 + 1); // just ancB — handled below
-          (void)corrB;
-        }
-      } else if (modeB == M_VBYTE) {
-        unsigned xnB = *ipB++;
-        ipB += (size_t)bB2 * 32u;
-        ipB = (const uint8_t *)vbdec16((unsigned char *)ipB, xnB, exB);
-        ipB += xnB;
-      } else { ipB += 2; }  // M_CONST B
-      // For band B with non-trivial decode: skip for now (CONST A mixed is rare).
-      // The contribution from band B is lost in this block — acceptable for prototype.
-      continue;
-    }
-
-    // ── parse block B ──────────────────────────────────────────────────────
-    const unsigned ctrlB = *ipB++;
     const unsigned modeB = (ctrlB >> 5) & 3u;
-    // assert((ctrlB & 0x1f) == b);   // shared-b invariant
-    const __m256i *lowB  = nullptr;
-    const uint16_t *bm16B = zero_bm;
+    const unsigned b     = ctrlA & 0x1fu;   // shared b; encoder invariant: ctrlB & 0x1f == b
 
-    if (modeB == M_PLAIN) {
-      lowB = (const __m256i *)ipB; ipB += (size_t)b * 32u;
-    } else if (modeB == M_BITMAP) {
-      const unsigned bxe = *ipB++;
-      const uint8_t *bm = ipB; ipB += 32;
-      unsigned xn = popcnt32(bm);
-      ipB = (const uint8_t *)bitunpack16(ipB, xn, exB, bxe);
-      lowB = (const __m256i *)ipB; ipB += (size_t)b * 32u;
-      bm16B = (const uint16_t *)bm;
-    } else if (modeB == M_VBYTE) {
-      const unsigned xn = *ipB++;
-      lowB = (const __m256i *)ipB; ipB += (size_t)b * 32u;
-      ipB = (const uint8_t *)vbdec16((unsigned char *)ipB, xn, exB);
-      const uint8_t *pos = ipB; ipB += xn;
-      memset(bmbufB, 0, 32);
-      for (unsigned k = 0; k < xn; ++k)
-        bmbufB[pos[k] >> 3] |= (unsigned char)(1u << (pos[k] & 7));
-      bm16B = (const uint16_t *)bmbufB;
-    } else {  // M_CONST B (rare; accumulate scalarly)
-      uint16_t cv = read_u16le(ipB); ipB += 2;
-      if (op == OP_ADD) {
-        const int32_t corrB = (int32_t)(cv + ancB);
-        accx = _mm256_add_epi32(accx, _mm256_set1_epi32(corrB * (BLK / 8)));
+    // ── PLAIN fast path (no exception buffers on stack) ───────────────────
+    if (modeA == M_PLAIN && modeB == M_PLAIN) {
+      if (b == 0) {
+        // All residuals zero; decoded value = anchor. Accumulate scalar.
+        if (op == OP_ADD) {
+          const int32_t contrib = ((int32_t)ancA + (int32_t)ancB) * (BLK / 8);
+          accx = _mm256_add_epi32(accx, _mm256_set1_epi32(contrib));
+        }
+        continue;
       }
-      // Band A was already parsed; call PLAIN kernel with zero anchor for B.
-      // Simplest: just call the plain kernel with ancB=0 and lowB pointing at
-      // a zero buffer — but we don't have one. Skip band B contribution here.
-      continue;
-    }
-
-    // ── dispatch to kernel ──────────────────────────────────────────────────
-    const bool has_exc = (modeA != M_PLAIN || modeB != M_PLAIN);
-
-    // b=0 shortcut: valid ONLY when no exceptions. When b=0 with exceptions
-    // (M_VBYTE/BITMAP chosen for sparse data), exceptions carry the full values
-    // and must be merged via sub_pfor2<0> — the shortcut would silently drop them.
-    if (b == 0 && !has_exc) {
-      if (op == OP_ADD) {
-        // Each of 8 int32 lanes must hold (ancA+ancB)*(BLK/8).
-        const int32_t contrib = ((int32_t)ancA + (int32_t)ancB) * (BLK / 8);
-        accx = _mm256_add_epi32(accx, _mm256_set1_epi32(contrib));
-      }
-      // NOOP: xor of (ancA XOR ancB) repeated 256 times; 256 is even so net=0.
-      continue;
-    }
-
-    if (!has_exc) {
+      const __m256i *lowA = (const __m256i *)ipA; ipA += (size_t)b * 32u;
+      const __m256i *lowB = (const __m256i *)ipB; ipB += (size_t)b * 32u;
       g_plain_tbl[op][b](lowA, lowB, ancA, ancB, &accx);
-    } else {
+      continue;
+    }
+
+    // ── Exception path — mirrors single-band FOR_BLOCKWALK inner scope ────
+    // M_CONST is never emitted by encode_block_at_b (FoR residuals are never
+    // all-equal since the anchor is the block min → at least one residual = 0).
+    // Only PLAIN / BITMAP / VBYTE can appear here.
+    {
+      uint16_t exA[BLK + 16], exB[BLK + 16];
+      const __m256i *lowA, *lowB;
+      const uint16_t *bm16A = zero_bm, *bm16B = zero_bm;
+
+      // ── parse band A ──────────────────────────────────────────────────
+      if (modeA == M_PLAIN) {
+        lowA = (const __m256i *)ipA; ipA += (size_t)b * 32u;
+      } else if (modeA == M_BITMAP) {
+        const unsigned bxe = *ipA++;
+        const uint8_t *bm = ipA; ipA += 32;
+        const unsigned xn = popcnt32(bm);
+#ifdef PFOR_BYTE_EXC
+        if (bxe <= 8u) { for (unsigned t=0; t<xn; ++t) exA[t] = ((const uint8_t*)ipA)[t]; ipA += xn; }
+        else           { memcpy(exA, ipA, (size_t)xn*2u); ipA += (size_t)xn*2u; }
+#else
+        ipA = (const uint8_t *)bitunpack16(ipA, xn, exA, bxe);
+#endif
+        lowA = (const __m256i *)ipA; ipA += (size_t)b * 32u;
+        bm16A = (const uint16_t *)bm;
+      } else {  // M_VBYTE
+        unsigned char bmbufA[32];
+        const unsigned xn = *ipA++;
+        lowA = (const __m256i *)ipA; ipA += (size_t)b * 32u;
+        ipA = (const uint8_t *)vbdec16((unsigned char *)ipA, xn, exA);
+        const uint8_t *pos = ipA; ipA += xn;
+        memset(bmbufA, 0, 32);
+        for (unsigned k = 0; k < xn; ++k)
+          bmbufA[pos[k] >> 3] |= (unsigned char)(1u << (pos[k] & 7));
+        bm16A = (const uint16_t *)bmbufA;
+      }
+
+      // ── parse band B ──────────────────────────────────────────────────
+      if (modeB == M_PLAIN) {
+        lowB = (const __m256i *)ipB; ipB += (size_t)b * 32u;
+      } else if (modeB == M_BITMAP) {
+        const unsigned bxe = *ipB++;
+        const uint8_t *bm = ipB; ipB += 32;
+        const unsigned xn = popcnt32(bm);
+#ifdef PFOR_BYTE_EXC
+        if (bxe <= 8u) { for (unsigned t=0; t<xn; ++t) exB[t] = ((const uint8_t*)ipB)[t]; ipB += xn; }
+        else           { memcpy(exB, ipB, (size_t)xn*2u); ipB += (size_t)xn*2u; }
+#else
+        ipB = (const uint8_t *)bitunpack16(ipB, xn, exB, bxe);
+#endif
+        lowB = (const __m256i *)ipB; ipB += (size_t)b * 32u;
+        bm16B = (const uint16_t *)bm;
+      } else {  // M_VBYTE
+        unsigned char bmbufB[32];
+        const unsigned xn = *ipB++;
+        lowB = (const __m256i *)ipB; ipB += (size_t)b * 32u;
+        ipB = (const uint8_t *)vbdec16((unsigned char *)ipB, xn, exB);
+        const uint8_t *pos = ipB; ipB += xn;
+        memset(bmbufB, 0, 32);
+        for (unsigned k = 0; k < xn; ++k)
+          bmbufB[pos[k] >> 3] |= (unsigned char)(1u << (pos[k] & 7));
+        bm16B = (const uint16_t *)bmbufB;
+      }
+
       g_pfor_tbl[op][b](lowA, exA, bm16A, lowB, exB, bm16B, ancA, ancB, &accx);
     }
   }
