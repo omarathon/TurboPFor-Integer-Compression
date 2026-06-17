@@ -436,6 +436,14 @@ static inline uint16_t read_u16le(const uint8_t *p) {
   return (uint16_t)((unsigned)p[0] | ((unsigned)p[1] << 8));
 }
 
+static inline int32_t hsum_epi32(__m256i v) {
+  __m128i lo = _mm256_castsi256_si128(v), hi = _mm256_extracti128_si256(v, 1);
+  __m128i s = _mm_add_epi32(lo, hi);
+  s = _mm_hadd_epi32(s, s);
+  s = _mm_hadd_epi32(s, s);
+  return _mm_cvtsi128_si32(s);
+}
+
 // ── SIMD exception sum (mirrors vp4d256v16_fused.c sum_excess_u16) ───────────
 // Widens uint16 excess values to uint32 and reduces: 16-at-a-time AVX2 loop.
 // Works for both bit-packed excess (uint16) and byte-aligned excess stored as
@@ -855,10 +863,8 @@ extern "C" double ndvi2_pfor_for_indep(
       uint16_t exA[BLK + 16], exB[BLK + 16];
       const __m256i *lowA, *lowB;
       const uint16_t *bm16A = zero_bm, *bm16B = zero_bm;
-      // xnA/xnB: exception counts — only used for PFOR_SKIP_MERGE_EXC scalar sum.
-#ifdef PFOR_SKIP_MERGE_EXC
       unsigned xnA = 0, xnB = 0;
-#endif
+      unsigned char bmbufA[32], bmbufB[32];
 
       // ── parse band A ──────────────────────────────────────────────────
       if (modeA == M_PLAIN) {
@@ -866,35 +872,29 @@ extern "C" double ndvi2_pfor_for_indep(
       } else if (modeA == M_BITMAP) {
         const unsigned bxe = *ipA++;
         const uint8_t *bm = ipA; ipA += 32;
-        const unsigned xn = popcnt32(bm);
-#ifdef PFOR_SKIP_MERGE_EXC
-        xnA = xn;
-#endif
+        xnA = popcnt32(bm);
 #ifdef PFOR_BYTE_EXC
-        if (bxe <= 8u) { for (unsigned t=0; t<xn; ++t) exA[t] = ((const uint8_t*)ipA)[t]; ipA += xn; }
-        else           { memcpy(exA, ipA, (size_t)xn*2u); ipA += (size_t)xn*2u; }
+        if (bxe <= 8u) { for (unsigned t=0; t<xnA; ++t) exA[t] = ((const uint8_t*)ipA)[t]; ipA += xnA; }
+        else           { memcpy(exA, ipA, (size_t)xnA*2u); ipA += (size_t)xnA*2u; }
 #else
-        ipA = (const uint8_t *)bitunpack16(ipA, xn, exA, bxe);
+        ipA = (const uint8_t *)bitunpack16(ipA, xnA, exA, bxe);
 #endif
         lowA = (const __m256i *)ipA; ipA += (size_t)b * 32u;
         bm16A = (const uint16_t *)bm;
 #ifndef PFOR_BYTE_EXC
       } else {  // M_VBYTE (only reachable without PFOR_BYTE_EXC; encoder forces BITMAP under BYTE_EXC)
-        const unsigned xn = *ipA++;
-#ifdef PFOR_SKIP_MERGE_EXC
-        xnA = xn;
-#endif
+        xnA = *ipA++;
         lowA = (const __m256i *)ipA; ipA += (size_t)b * 32u;
-        ipA = (const uint8_t *)vbdec16((unsigned char *)ipA, xn, exA);
-#ifdef PFOR_SKIP_MERGE_EXC
-        ipA += xn;  // skip position bytes — not needed for scalar sum
-#else
-        { const uint8_t *pos = ipA; ipA += xn;
-          unsigned char bmbufA[32]; memset(bmbufA, 0, 32);
-          for (unsigned k = 0; k < xn; ++k)
+        ipA = (const uint8_t *)vbdec16((unsigned char *)ipA, xnA, exA);
+        if (op == OP_ADD) {
+          ipA += xnA;  // skip positions — hsum doesn't need lane placement
+        } else {
+          const uint8_t *pos = ipA; ipA += xnA;
+          memset(bmbufA, 0, 32);
+          for (unsigned k = 0; k < xnA; ++k)
             bmbufA[pos[k] >> 3] |= (unsigned char)(1u << (pos[k] & 7));
-          bm16A = (const uint16_t *)bmbufA; }
-#endif
+          bm16A = (const uint16_t *)bmbufA;
+        }
 #endif
       }
 
@@ -904,54 +904,40 @@ extern "C" double ndvi2_pfor_for_indep(
       } else if (modeB == M_BITMAP) {
         const unsigned bxe = *ipB++;
         const uint8_t *bm = ipB; ipB += 32;
-        const unsigned xn = popcnt32(bm);
-#ifdef PFOR_SKIP_MERGE_EXC
-        xnB = xn;
-#endif
+        xnB = popcnt32(bm);
 #ifdef PFOR_BYTE_EXC
-        if (bxe <= 8u) { for (unsigned t=0; t<xn; ++t) exB[t] = ((const uint8_t*)ipB)[t]; ipB += xn; }
-        else           { memcpy(exB, ipB, (size_t)xn*2u); ipB += (size_t)xn*2u; }
+        if (bxe <= 8u) { for (unsigned t=0; t<xnB; ++t) exB[t] = ((const uint8_t*)ipB)[t]; ipB += xnB; }
+        else           { memcpy(exB, ipB, (size_t)xnB*2u); ipB += (size_t)xnB*2u; }
 #else
-        ipB = (const uint8_t *)bitunpack16(ipB, xn, exB, bxe);
+        ipB = (const uint8_t *)bitunpack16(ipB, xnB, exB, bxe);
 #endif
         lowB = (const __m256i *)ipB; ipB += (size_t)b * 32u;
         bm16B = (const uint16_t *)bm;
 #ifndef PFOR_BYTE_EXC
       } else {  // M_VBYTE (only reachable without PFOR_BYTE_EXC)
-        const unsigned xn = *ipB++;
-#ifdef PFOR_SKIP_MERGE_EXC
-        xnB = xn;
-#endif
+        xnB = *ipB++;
         lowB = (const __m256i *)ipB; ipB += (size_t)b * 32u;
-        ipB = (const uint8_t *)vbdec16((unsigned char *)ipB, xn, exB);
-#ifdef PFOR_SKIP_MERGE_EXC
-        ipB += xn;  // skip position bytes — not needed for scalar sum
-#else
-        { const uint8_t *pos = ipB; ipB += xn;
-          unsigned char bmbufB[32]; memset(bmbufB, 0, 32);
-          for (unsigned k = 0; k < xn; ++k)
+        ipB = (const uint8_t *)vbdec16((unsigned char *)ipB, xnB, exB);
+        if (op == OP_ADD) {
+          ipB += xnB;
+        } else {
+          const uint8_t *pos = ipB; ipB += xnB;
+          memset(bmbufB, 0, 32);
+          for (unsigned k = 0; k < xnB; ++k)
             bmbufB[pos[k] >> 3] |= (unsigned char)(1u << (pos[k] & 7));
-          bm16B = (const uint16_t *)bmbufB; }
-#endif
+          bm16B = (const uint16_t *)bmbufB;
+        }
 #endif
       }
 
-#ifdef PFOR_SKIP_MERGE_EXC
-      // Skip-merge path: for OP_ADD, sum = plain_kernel(lowA+lowB) + sum(exA<<b) + sum(exB<<b).
-      // Valid because sum(A+B) separates into per-band sums, each satisfying the same
-      // sum(low) + sum(exc<<b) identity as single-band sum. Results (XOR-fold) will NOT
-      // match the full-merge path — this is a timing diagnostic for the pshufb merge cost.
       if (op == OP_ADD) {
         g_plain_tbl[OP_ADD][b](lowA, lowB, ancA, ancB, &accx);
-        uint64_t es = sum_excess_u16(exA, xnA) + sum_excess_u16(exB, xnB);
-        int32_t exc_sum = (int32_t)((int64_t)es << b);
-        accx = _mm256_add_epi32(accx, _mm256_set_epi32(0,0,0,0,0,0,0,exc_sum));
+        const uint64_t es = sum_excess_u16(exA, xnA) + sum_excess_u16(exB, xnB);
+        accx = _mm256_add_epi32(accx,
+            _mm256_set_epi32(0,0,0,0,0,0,0,(int32_t)((uint64_t)es << b)));
       } else {
         g_pfor_tbl[op][b](lowA, exA, bm16A, lowB, exB, bm16B, ancA, ancB, &accx);
       }
-#else
-      g_pfor_tbl[op][b](lowA, exA, bm16A, lowB, exB, bm16B, ancA, ancB, &accx);
-#endif
     }
   }
 
@@ -965,13 +951,13 @@ extern "C" double ndvi2_pfor_for_indep(
           _mm256_set_epi32(0,0,0,0,0,0,0,(int)((uint32_t)va + vb)));
   }
 
-  // XOR-fold reduction: same formula as ndvi2_indep's xreduce() so that the
-  // bench 'result' field matches simdcomp_fused for correctness cross-checking.
-  alignas(32) int32_t v[8];
-  _mm256_store_si256((__m256i*)v, accx);
-  int64_t r = 0;
-  for (int i = 0; i < 8; ++i) r ^= v[i];
-  return (double)(r & 0xFFFF);
+  if (op == OP_ADD)
+    return (double)(uint16_t)(uint32_t)hsum_epi32(accx);
+  __m128i lo = _mm256_castsi256_si128(accx), hi = _mm256_extracti128_si256(accx, 1);
+  __m128i x = _mm_xor_si128(lo, hi);
+  x = _mm_xor_si128(x, _mm_shuffle_epi32(x, 0x4E));
+  x = _mm_xor_si128(x, _mm_shuffle_epi32(x, 0xB1));
+  return (double)(uint16_t)(uint32_t)_mm_cvtsi128_si32(x);
 }
 
 // ── fine-window FoR encoder ───────────────────────────────────────────────────
@@ -1104,31 +1090,37 @@ extern "C" double ndvi2_pfor_for_indep_w(
       uint16_t exA[BLK + 16], exB[BLK + 16];
       const __m256i *lowA, *lowB;
       const uint16_t *bm16A = zero_bm, *bm16B = zero_bm;
+      unsigned xnA = 0, xnB = 0;
+      unsigned char bmbufA[32], bmbufB[32];
 
       if (modeA == M_PLAIN) {
         lowA = (const __m256i *)ipA; ipA += (size_t)b * 32u;
       } else if (modeA == M_BITMAP) {
         const unsigned bxe = *ipA++;
         const uint8_t *bm = ipA; ipA += 32;
-        const unsigned xn = popcnt32(bm);
+        xnA = popcnt32(bm);
 #ifdef PFOR_BYTE_EXC
-        if (bxe <= 8u) { for (unsigned t=0; t<xn; ++t) exA[t] = ((const uint8_t*)ipA)[t]; ipA += xn; }
-        else           { memcpy(exA, ipA, (size_t)xn*2u); ipA += (size_t)xn*2u; }
+        if (bxe <= 8u) { for (unsigned t=0; t<xnA; ++t) exA[t] = ((const uint8_t*)ipA)[t]; ipA += xnA; }
+        else           { memcpy(exA, ipA, (size_t)xnA*2u); ipA += (size_t)xnA*2u; }
 #else
-        ipA = (const uint8_t *)bitunpack16(ipA, xn, exA, bxe);
+        ipA = (const uint8_t *)bitunpack16(ipA, xnA, exA, bxe);
 #endif
         lowA = (const __m256i *)ipA; ipA += (size_t)b * 32u;
         bm16A = (const uint16_t *)bm;
 #ifndef PFOR_BYTE_EXC
       } else {
-        const unsigned xn = *ipA++;
+        xnA = *ipA++;
         lowA = (const __m256i *)ipA; ipA += (size_t)b * 32u;
-        ipA = (const uint8_t *)vbdec16((unsigned char *)ipA, xn, exA);
-        { const uint8_t *pos = ipA; ipA += xn;
-          unsigned char bmbufA[32]; memset(bmbufA, 0, 32);
-          for (unsigned k = 0; k < xn; ++k)
+        ipA = (const uint8_t *)vbdec16((unsigned char *)ipA, xnA, exA);
+        if (op == OP_ADD) {
+          ipA += xnA;
+        } else {
+          const uint8_t *pos = ipA; ipA += xnA;
+          memset(bmbufA, 0, 32);
+          for (unsigned k = 0; k < xnA; ++k)
             bmbufA[pos[k] >> 3] |= (unsigned char)(1u << (pos[k] & 7));
-          bm16A = (const uint16_t *)bmbufA; }
+          bm16A = (const uint16_t *)bmbufA;
+        }
 #endif
       }
 
@@ -1137,34 +1129,50 @@ extern "C" double ndvi2_pfor_for_indep_w(
       } else if (modeB == M_BITMAP) {
         const unsigned bxe = *ipB++;
         const uint8_t *bm = ipB; ipB += 32;
-        const unsigned xn = popcnt32(bm);
+        xnB = popcnt32(bm);
 #ifdef PFOR_BYTE_EXC
-        if (bxe <= 8u) { for (unsigned t=0; t<xn; ++t) exB[t] = ((const uint8_t*)ipB)[t]; ipB += xn; }
-        else           { memcpy(exB, ipB, (size_t)xn*2u); ipB += (size_t)xn*2u; }
+        if (bxe <= 8u) { for (unsigned t=0; t<xnB; ++t) exB[t] = ((const uint8_t*)ipB)[t]; ipB += xnB; }
+        else           { memcpy(exB, ipB, (size_t)xnB*2u); ipB += (size_t)xnB*2u; }
 #else
-        ipB = (const uint8_t *)bitunpack16(ipB, xn, exB, bxe);
+        ipB = (const uint8_t *)bitunpack16(ipB, xnB, exB, bxe);
 #endif
         lowB = (const __m256i *)ipB; ipB += (size_t)b * 32u;
         bm16B = (const uint16_t *)bm;
 #ifndef PFOR_BYTE_EXC
       } else {
-        const unsigned xn = *ipB++;
+        xnB = *ipB++;
         lowB = (const __m256i *)ipB; ipB += (size_t)b * 32u;
-        ipB = (const uint8_t *)vbdec16((unsigned char *)ipB, xn, exB);
-        { const uint8_t *pos = ipB; ipB += xn;
-          unsigned char bmbufB[32]; memset(bmbufB, 0, 32);
-          for (unsigned k = 0; k < xn; ++k)
+        ipB = (const uint8_t *)vbdec16((unsigned char *)ipB, xnB, exB);
+        if (op == OP_ADD) {
+          ipB += xnB;
+        } else {
+          const uint8_t *pos = ipB; ipB += xnB;
+          memset(bmbufB, 0, 32);
+          for (unsigned k = 0; k < xnB; ++k)
             bmbufB[pos[k] >> 3] |= (unsigned char)(1u << (pos[k] & 7));
-          bm16B = (const uint16_t *)bmbufB; }
+          bm16B = (const uint16_t *)bmbufB;
+        }
 #endif
       }
 
-      if (w >= 16u)
-        g_pfor_csc[op][b](lowA, exA, bm16A, lowB, exB, bm16B, ancs16A, ancs16B, &accx);
-      else if (w == 8u)
-        g_pfor_half[op][b](lowA, exA, bm16A, lowB, exB, bm16B, anc_blkA, anc_blkB, &accx);
-      else
-        g_pfor_qtr[op][b](lowA, exA, bm16A, lowB, exB, bm16B, anc_blkA, anc_blkB, &accx);
+      if (op == OP_ADD) {
+        if (w >= 16u)
+          g_plain_csc[OP_ADD][b](lowA, lowB, ancs16A, ancs16B, &accx);
+        else if (w == 8u)
+          g_plain_half[OP_ADD][b](lowA, lowB, anc_blkA, anc_blkB, &accx);
+        else
+          g_plain_qtr[OP_ADD][b](lowA, lowB, anc_blkA, anc_blkB, &accx);
+        const uint64_t es = sum_excess_u16(exA, xnA) + sum_excess_u16(exB, xnB);
+        accx = _mm256_add_epi32(accx,
+            _mm256_set_epi32(0,0,0,0,0,0,0,(int32_t)((uint64_t)es << b)));
+      } else {
+        if (w >= 16u)
+          g_pfor_csc[op][b](lowA, exA, bm16A, lowB, exB, bm16B, ancs16A, ancs16B, &accx);
+        else if (w == 8u)
+          g_pfor_half[op][b](lowA, exA, bm16A, lowB, exB, bm16B, anc_blkA, anc_blkB, &accx);
+        else
+          g_pfor_qtr[op][b](lowA, exA, bm16A, lowB, exB, bm16B, anc_blkA, anc_blkB, &accx);
+      }
     }
   }
 
@@ -1177,9 +1185,11 @@ extern "C" double ndvi2_pfor_for_indep_w(
           _mm256_set_epi32(0,0,0,0,0,0,0,(int)((uint32_t)va + vb)));
   }
 
-  alignas(32) int32_t v[8];
-  _mm256_store_si256((__m256i*)v, accx);
-  int64_t r = 0;
-  for (int i = 0; i < 8; ++i) r ^= v[i];
-  return (double)(r & 0xFFFF);
+  if (op == OP_ADD)
+    return (double)(uint16_t)(uint32_t)hsum_epi32(accx);
+  __m128i lo = _mm256_castsi256_si128(accx), hi = _mm256_extracti128_si256(accx, 1);
+  __m128i x = _mm_xor_si128(lo, hi);
+  x = _mm_xor_si128(x, _mm_shuffle_epi32(x, 0x4E));
+  x = _mm_xor_si128(x, _mm_shuffle_epi32(x, 0xB1));
+  return (double)(uint16_t)(uint32_t)_mm_cvtsi128_si32(x);
 }
