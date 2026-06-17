@@ -662,7 +662,8 @@ extern "C" double ndvi2_pfor_for_indep(
 #endif
         lowA = (const __m256i *)ipA; ipA += (size_t)b * 32u;
         bm16A = (const uint16_t *)bm;
-      } else {  // M_VBYTE
+#ifndef PFOR_BYTE_EXC
+      } else {  // M_VBYTE (only reachable without PFOR_BYTE_EXC; encoder forces BITMAP under BYTE_EXC)
         unsigned char bmbufA[32];
         const unsigned xn = *ipA++;
         lowA = (const __m256i *)ipA; ipA += (size_t)b * 32u;
@@ -672,6 +673,7 @@ extern "C" double ndvi2_pfor_for_indep(
         for (unsigned k = 0; k < xn; ++k)
           bmbufA[pos[k] >> 3] |= (unsigned char)(1u << (pos[k] & 7));
         bm16A = (const uint16_t *)bmbufA;
+#endif
       }
 
       // ── parse band B ──────────────────────────────────────────────────
@@ -689,7 +691,8 @@ extern "C" double ndvi2_pfor_for_indep(
 #endif
         lowB = (const __m256i *)ipB; ipB += (size_t)b * 32u;
         bm16B = (const uint16_t *)bm;
-      } else {  // M_VBYTE
+#ifndef PFOR_BYTE_EXC
+      } else {  // M_VBYTE (only reachable without PFOR_BYTE_EXC)
         unsigned char bmbufB[32];
         const unsigned xn = *ipB++;
         lowB = (const __m256i *)ipB; ipB += (size_t)b * 32u;
@@ -699,6 +702,7 @@ extern "C" double ndvi2_pfor_for_indep(
         for (unsigned k = 0; k < xn; ++k)
           bmbufB[pos[k] >> 3] |= (unsigned char)(1u << (pos[k] & 7));
         bm16B = (const uint16_t *)bmbufB;
+#endif
       }
 
       g_pfor_tbl[op][b](lowA, exA, bm16A, lowB, exB, bm16B, ancA, ancB, &accx);
