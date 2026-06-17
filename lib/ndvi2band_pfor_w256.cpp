@@ -646,6 +646,10 @@ extern "C" double ndvi2_pfor_for_indep(
       uint16_t exA[BLK + 16], exB[BLK + 16];
       const __m256i *lowA, *lowB;
       const uint16_t *bm16A = zero_bm, *bm16B = zero_bm;
+      // xnA/xnB: exception counts — only used for PFOR_SKIP_MERGE_EXC scalar sum.
+#ifdef PFOR_SKIP_MERGE_EXC
+      unsigned xnA = 0, xnB = 0;
+#endif
 
       // ── parse band A ──────────────────────────────────────────────────
       if (modeA == M_PLAIN) {
@@ -654,6 +658,9 @@ extern "C" double ndvi2_pfor_for_indep(
         const unsigned bxe = *ipA++;
         const uint8_t *bm = ipA; ipA += 32;
         const unsigned xn = popcnt32(bm);
+#ifdef PFOR_SKIP_MERGE_EXC
+        xnA = xn;
+#endif
 #ifdef PFOR_BYTE_EXC
         if (bxe <= 8u) { for (unsigned t=0; t<xn; ++t) exA[t] = ((const uint8_t*)ipA)[t]; ipA += xn; }
         else           { memcpy(exA, ipA, (size_t)xn*2u); ipA += (size_t)xn*2u; }
@@ -664,15 +671,21 @@ extern "C" double ndvi2_pfor_for_indep(
         bm16A = (const uint16_t *)bm;
 #ifndef PFOR_BYTE_EXC
       } else {  // M_VBYTE (only reachable without PFOR_BYTE_EXC; encoder forces BITMAP under BYTE_EXC)
-        unsigned char bmbufA[32];
         const unsigned xn = *ipA++;
+#ifdef PFOR_SKIP_MERGE_EXC
+        xnA = xn;
+#endif
         lowA = (const __m256i *)ipA; ipA += (size_t)b * 32u;
         ipA = (const uint8_t *)vbdec16((unsigned char *)ipA, xn, exA);
-        const uint8_t *pos = ipA; ipA += xn;
-        memset(bmbufA, 0, 32);
-        for (unsigned k = 0; k < xn; ++k)
-          bmbufA[pos[k] >> 3] |= (unsigned char)(1u << (pos[k] & 7));
-        bm16A = (const uint16_t *)bmbufA;
+#ifdef PFOR_SKIP_MERGE_EXC
+        ipA += xn;  // skip position bytes — not needed for scalar sum
+#else
+        { const uint8_t *pos = ipA; ipA += xn;
+          unsigned char bmbufA[32]; memset(bmbufA, 0, 32);
+          for (unsigned k = 0; k < xn; ++k)
+            bmbufA[pos[k] >> 3] |= (unsigned char)(1u << (pos[k] & 7));
+          bm16A = (const uint16_t *)bmbufA; }
+#endif
 #endif
       }
 
@@ -683,6 +696,9 @@ extern "C" double ndvi2_pfor_for_indep(
         const unsigned bxe = *ipB++;
         const uint8_t *bm = ipB; ipB += 32;
         const unsigned xn = popcnt32(bm);
+#ifdef PFOR_SKIP_MERGE_EXC
+        xnB = xn;
+#endif
 #ifdef PFOR_BYTE_EXC
         if (bxe <= 8u) { for (unsigned t=0; t<xn; ++t) exB[t] = ((const uint8_t*)ipB)[t]; ipB += xn; }
         else           { memcpy(exB, ipB, (size_t)xn*2u); ipB += (size_t)xn*2u; }
@@ -693,19 +709,41 @@ extern "C" double ndvi2_pfor_for_indep(
         bm16B = (const uint16_t *)bm;
 #ifndef PFOR_BYTE_EXC
       } else {  // M_VBYTE (only reachable without PFOR_BYTE_EXC)
-        unsigned char bmbufB[32];
         const unsigned xn = *ipB++;
+#ifdef PFOR_SKIP_MERGE_EXC
+        xnB = xn;
+#endif
         lowB = (const __m256i *)ipB; ipB += (size_t)b * 32u;
         ipB = (const uint8_t *)vbdec16((unsigned char *)ipB, xn, exB);
-        const uint8_t *pos = ipB; ipB += xn;
-        memset(bmbufB, 0, 32);
-        for (unsigned k = 0; k < xn; ++k)
-          bmbufB[pos[k] >> 3] |= (unsigned char)(1u << (pos[k] & 7));
-        bm16B = (const uint16_t *)bmbufB;
+#ifdef PFOR_SKIP_MERGE_EXC
+        ipB += xn;  // skip position bytes — not needed for scalar sum
+#else
+        { const uint8_t *pos = ipB; ipB += xn;
+          unsigned char bmbufB[32]; memset(bmbufB, 0, 32);
+          for (unsigned k = 0; k < xn; ++k)
+            bmbufB[pos[k] >> 3] |= (unsigned char)(1u << (pos[k] & 7));
+          bm16B = (const uint16_t *)bmbufB; }
+#endif
 #endif
       }
 
+#ifdef PFOR_SKIP_MERGE_EXC
+      // Skip-merge path: for OP_ADD, sum = plain_kernel(lowA+lowB) + sum(exA<<b) + sum(exB<<b).
+      // Valid because sum(A+B) separates into per-band sums, each satisfying the same
+      // sum(low) + sum(exc<<b) identity as single-band sum. Results (XOR-fold) will NOT
+      // match the full-merge path — this is a timing diagnostic for the pshufb merge cost.
+      if (op == OP_ADD) {
+        g_plain_tbl[OP_ADD][b](lowA, lowB, ancA, ancB, &accx);
+        int32_t exc_sum = 0;
+        for (unsigned k = 0; k < xnA; ++k) exc_sum += (int32_t)exA[k] << b;
+        for (unsigned k = 0; k < xnB; ++k) exc_sum += (int32_t)exB[k] << b;
+        accx = _mm256_add_epi32(accx, _mm256_set_epi32(0,0,0,0,0,0,0,exc_sum));
+      } else {
+        g_pfor_tbl[op][b](lowA, exA, bm16A, lowB, exB, bm16B, ancA, ancB, &accx);
+      }
+#else
       g_pfor_tbl[op][b](lowA, exA, bm16A, lowB, exB, bm16B, ancA, ancB, &accx);
+#endif
     }
   }
 
